@@ -37,8 +37,6 @@ PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(lwaldump);
 
-static const char *progname;
-
 static int	WalSegSz;
 
 typedef struct XLogDumpPrivate
@@ -83,16 +81,13 @@ static void
 fatal_error(const char *fmt,...)
 {
 	va_list		args;
+	char		message[1024];
 
-	fflush(stdout);
-
-	fprintf(stderr, _("%s: FATAL:  "), progname);
 	va_start(args, fmt);
-	vfprintf(stderr, _(fmt), args);
+	vsnprintf(message, sizeof(message), _(fmt), args);
 	va_end(args);
-	fputc('\n', stderr);
 
-	exit(EXIT_FAILURE);
+	ereport(ERROR, (errmsg_internal("%s", message)));
 }
 
 /*
@@ -263,6 +258,47 @@ identify_target_directory(XLogDumpPrivate *private, char *directory,
 		fatal_error("could not find any WAL file");
 }
 
+/*
+ * Freeze the scan at the end of the newest local segment on this timeline.
+ * Without an upper bound XLogReader tries to open the next, absent segment
+ * after consuming a segment exactly to its end.
+ */
+static XLogRecPtr
+find_local_wal_end(const char *directory, TimeLineID timeline)
+{
+	DIR		   *xldir;
+	struct dirent *xlde;
+	XLogSegNo	max_segno = 0;
+	bool		found = false;
+
+	xldir = opendir(directory);
+	if (xldir == NULL)
+		fatal_error("could not open directory \"%s\": %s",
+					directory, strerror(errno));
+
+	while ((xlde = readdir(xldir)) != NULL)
+	{
+		TimeLineID	file_timeline;
+		XLogSegNo	segno;
+
+		if (!IsXLogFileName(xlde->d_name))
+			continue;
+
+		XLogFromFileName(xlde->d_name, &file_timeline, &segno, WalSegSz);
+		if (file_timeline == timeline && (!found || segno > max_segno))
+		{
+			max_segno = segno;
+			found = true;
+		}
+	}
+
+	closedir(xldir);
+	if (!found)
+		fatal_error("could not find a WAL file for timeline %u", timeline);
+
+	return (max_segno + 1) * WalSegSz;
+}
+
 /* pg_waldump's XLogReaderRoutine->segment_open callback */
 static void
 WALDumpOpenSegment(XLogReaderState *state, XLogSegNo nextSegNo,
@@ -389,15 +425,11 @@ lwaldump(PG_FUNCTION_ARGS)
 	config.stats = false;
 	config.stats_per_record = false;
 
-	identify_target_directory(&private, private.inpath, NULL);
 	private.startptr = GetXLogReplayRecPtr(&private.timeline);
-	/* we don't know what to print */
 	if (XLogRecPtrIsInvalid(private.startptr))
-	{
-		fprintf(stderr, _("replayptr: %lu, timeline: %u\n"), private.startptr, private.timeline);
-		fprintf(stderr, _("%s: no start WAL location given\n"), progname);
-		goto bad_argument;
-	}
+		fatal_error("no replay WAL location available");
+	identify_target_directory(&private, private.inpath, NULL);
+	private.endptr = find_local_wal_end(private.inpath, private.timeline);
 
 	/* done with argument parsing, do the actual work */
 
@@ -446,9 +478,5 @@ lwaldump(PG_FUNCTION_ARGS)
 
 	XLogReaderFree(xlogreader_state);
 
-	PG_RETURN_LSN(last_lsn);
-bad_argument:
-	fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
-	fatal_error("bad argument");
 	PG_RETURN_LSN(last_lsn);
 }
