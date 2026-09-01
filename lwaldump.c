@@ -11,13 +11,10 @@
  *-------------------------------------------------------------------------
  */
 
-#define FRONTEND 1
-
 #include "postgres.h"
 #include "fmgr.h"
 #include "utils/builtins.h"
 #include "utils/pg_lsn.h"
-#include "postgres.h"
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -27,10 +24,10 @@
 #include "access/xlogrecord.h"
 #include "access/xlog_internal.h"
 #include "access/xlog.h"
+#if PG_VERSION_NUM >= 150000
+#include "access/xlogrecovery.h"
+#endif
 #include "access/transam.h"
-#include "common/fe_memutils.h"
-#include "common/logging.h"
-#include "getopt_long.h"
 #include "miscadmin.h"
 
 PG_MODULE_MAGIC;
@@ -445,7 +442,7 @@ lwaldump(PG_FUNCTION_ARGS)
 
 
 	first_record = private.startptr;
-	xlogreader_state->EndRecPtr = first_record;
+	XLogBeginRead(xlogreader_state, first_record);
 
 	last_lsn = private.startptr;
 	/*
