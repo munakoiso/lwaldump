@@ -6,13 +6,18 @@ ROOT="/tmp/lwaldump-timeline-test"
 PRIMARY="$ROOT/primary"
 CANDIDATE="$ROOT/candidate"
 VOTER="$ROOT/voter"
+BRANCH3="$ROOT/branch3"
+BRANCH4="$ROOT/branch4"
 WAL_ARCHIVE="$ROOT/wal-archive"
 PRIMARY_SOCKET="$ROOT/primary-socket"
 CANDIDATE_SOCKET="$ROOT/candidate-socket"
 VOTER_SOCKET="$ROOT/voter-socket"
+BRANCH3_SOCKET="$ROOT/branch3-socket"
+BRANCH4_SOCKET="$ROOT/branch4-socket"
 
-mkdir -p "$PRIMARY" "$CANDIDATE" "$VOTER" "$WAL_ARCHIVE" \
-    "$PRIMARY_SOCKET" "$CANDIDATE_SOCKET" "$VOTER_SOCKET"
+mkdir -p "$PRIMARY" "$CANDIDATE" "$VOTER" "$BRANCH3" "$BRANCH4" \
+    "$WAL_ARCHIVE" "$PRIMARY_SOCKET" "$CANDIDATE_SOCKET" "$VOTER_SOCKET" \
+    "$BRANCH3_SOCKET" "$BRANCH4_SOCKET"
 chown -R postgres:postgres "$ROOT"
 
 run_as_postgres() {
@@ -20,6 +25,8 @@ run_as_postgres() {
 }
 
 stop_clusters() {
+    run_as_postgres "$BIN/pg_ctl -D '$BRANCH4' -m immediate stop" >/dev/null 2>&1 || true
+    run_as_postgres "$BIN/pg_ctl -D '$BRANCH3' -m immediate stop" >/dev/null 2>&1 || true
     run_as_postgres "$BIN/pg_ctl -D '$VOTER' -m immediate stop" >/dev/null 2>&1 || true
     run_as_postgres "$BIN/pg_ctl -D '$CANDIDATE' -m immediate stop" >/dev/null 2>&1 || true
     run_as_postgres "$BIN/pg_ctl -D '$PRIMARY' -m immediate stop" >/dev/null 2>&1 || true
@@ -83,6 +90,9 @@ run_as_postgres "$BIN/pg_ctl -D '$CANDIDATE' -l '$ROOT/candidate.log' -w start" 
 run_as_postgres "$BIN/pg_ctl -D '$CANDIDATE' -w promote" >/dev/null
 
 run_as_postgres "$BIN/psql -h '$CANDIDATE_SOCKET' -p 55443 -d postgres -v ON_ERROR_STOP=1 -c \"INSERT INTO wal_payload SELECT g, repeat(md5(g::text), 12) FROM generate_series(50001, 51000) AS g\"" >/dev/null
+run_as_postgres "$BIN/pg_basebackup -h '$CANDIDATE_SOCKET' -p 55443 -D '$BRANCH3' -X stream -R --checkpoint=fast" >/dev/null
+run_as_postgres "$BIN/pg_basebackup -h '$CANDIDATE_SOCKET' -p 55443 -D '$BRANCH4' -X stream -R --checkpoint=fast" >/dev/null
+chmod 700 "$BRANCH3" "$BRANCH4"
 timeline2_end="$(run_as_postgres "$BIN/psql -h '$CANDIDATE_SOCKET' -p 55443 -d postgres -Atc 'SELECT pg_current_wal_flush_lsn()'")"
 
 cat >>"$VOTER/postgresql.conf" <<EOF
@@ -119,39 +129,77 @@ while :; do
     sleep 0.25
 done
 
-run_as_postgres "$BIN/pg_ctl -D '$CANDIDATE' -m fast -w stop" >/dev/null
-i=0
-while :; do
-    receivers="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -Atc 'SELECT count(*) FROM pg_stat_wal_receiver'")"
-    [ "$receivers" = "0" ] && break
-    i=$((i + 1))
-    [ "$i" -lt 80 ] || { echo "voter WAL receiver did not stop"; exit 28; }
-    sleep 0.25
-done
+cat >>"$BRANCH3/postgresql.conf" <<EOF
+port = 55445
+listen_addresses = ''
+unix_socket_directories = '$BRANCH3_SOCKET'
+hot_standby = on
+restore_command = ''
+recovery_target_timeline = 'current'
+EOF
+cat >>"$BRANCH3/postgresql.auto.conf" <<EOF
+primary_conninfo = ''
+EOF
+chown postgres:postgres "$BRANCH3/postgresql.conf" "$BRANCH3/postgresql.auto.conf"
+run_as_postgres "$BIN/pg_ctl -D '$BRANCH3' -l '$ROOT/branch3.log' -w start" >/dev/null
+run_as_postgres "$BIN/pg_ctl -D '$BRANCH3' -w promote" >/dev/null
+run_as_postgres "$BIN/psql -h '$BRANCH3_SOCKET' -p 55445 -d postgres -v ON_ERROR_STOP=1 -c \"INSERT INTO wal_payload VALUES (51001, repeat(md5('branch3'), 12))\"" >/dev/null
+timeline3_end="$(run_as_postgres "$BIN/psql -h '$BRANCH3_SOCKET' -p 55445 -d postgres -Atc 'SELECT pg_current_wal_flush_lsn()'")"
+run_as_postgres "$BIN/pg_ctl -D '$BRANCH3' -m fast -w stop" >/dev/null
+
+# Make the second promotion allocate timeline 4 while remaining on timeline 2.
+# The resulting timelines 3 and 4 are real sibling branches.
+cp "$BRANCH3/pg_wal/00000003.history" "$BRANCH4/pg_wal/"
+chown postgres:postgres "$BRANCH4/pg_wal/00000003.history"
+cat >>"$BRANCH4/postgresql.conf" <<EOF
+port = 55446
+listen_addresses = ''
+unix_socket_directories = '$BRANCH4_SOCKET'
+hot_standby = on
+restore_command = ''
+recovery_target_timeline = 'current'
+EOF
+cat >>"$BRANCH4/postgresql.auto.conf" <<EOF
+primary_conninfo = ''
+EOF
+chown postgres:postgres "$BRANCH4/postgresql.conf" "$BRANCH4/postgresql.auto.conf"
+run_as_postgres "$BIN/pg_ctl -D '$BRANCH4' -l '$ROOT/branch4.log' -w start" >/dev/null
+run_as_postgres "$BIN/pg_ctl -D '$BRANCH4' -w promote" >/dev/null
+run_as_postgres "$BIN/psql -h '$BRANCH4_SOCKET' -p 55446 -d postgres -v ON_ERROR_STOP=1 -c \"INSERT INTO wal_payload VALUES (51002, repeat(md5('branch4'), 12))\"" >/dev/null
+timeline4_end="$(run_as_postgres "$BIN/psql -h '$BRANCH4_SOCKET' -p 55446 -d postgres -Atc 'SELECT pg_current_wal_flush_lsn()'")"
+run_as_postgres "$BIN/pg_ctl -D '$BRANCH4' -m fast -w stop" >/dev/null
+
+[ "$(awk 'END { print $1 }' "$BRANCH3/pg_wal/00000003.history")" = "2" ] || exit 31
+[ "$(awk 'END { print $1 }' "$BRANCH4/pg_wal/00000004.history")" = "2" ] || exit 32
+cp "$BRANCH3"/pg_wal/00000003* "$VOTER/pg_wal/"
+cp "$BRANCH4"/pg_wal/00000004* "$VOTER/pg_wal/"
+chown postgres:postgres "$VOTER"/pg_wal/00000003* "$VOTER"/pg_wal/00000004*
 
 switchpoint="$(awk 'NR == 1 { print $2 }' "$VOTER/pg_wal/00000002.history")"
 switch_offset="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -Atc \"SELECT pg_wal_lsn_diff('$switchpoint', '0/0')::numeric % pg_size_bytes(current_setting('wal_segment_size'))\"")"
 [ "$switch_offset" = "0" ] || { echo "timeline switchpoint is not at a segment boundary: $switchpoint"; exit 26; }
 
-# A sibling history appears after PostgreSQL has already selected timeline 2.
-# It must not redirect an extension scan that starts while replay is on the
-# common timeline 1.
-printf '1\t%s\tsibling timeline\n' "$switchpoint" >"$VOTER/pg_wal/00000003.history"
-chown postgres:postgres "$VOTER/pg_wal/00000003.history"
+# An unrelated sibling appears after PostgreSQL has selected timeline 2. It
+# must not redirect a scan whose replay position is still on common timeline 1.
+printf '1\t%s\tunrelated sibling timeline\n' "$switchpoint" >"$VOTER/pg_wal/00000005.history"
+chown postgres:postgres "$VOTER/pg_wal/00000005.history"
 
 result="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -AtF '|' -v ON_ERROR_STOP=1 -c 'SELECT timeline, flush_lsn FROM lwaldump_with_timeline()'")"
 timeline="${result%%|*}"
 flush_lsn="${result#*|}"
-covers_timeline2="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -Atc \"SELECT '$flush_lsn'::pg_lsn >= '$timeline2_end'::pg_lsn\"")"
+covers_timeline4="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -Atc \"SELECT '$flush_lsn'::pg_lsn >= '$timeline4_end'::pg_lsn\"")"
 
 echo "RECOVERY_PATH_OUTPUT=$result"
 echo "TIMELINE2_END=$timeline2_end"
-echo "COVERS_TIMELINE2=$covers_timeline2"
-[ "$timeline" = "2" ] || exit 21
-[ "$covers_timeline2" = "t" ] || exit 22
+echo "TIMELINE3_END=$timeline3_end"
+echo "TIMELINE4_END=$timeline4_end"
+echo "COVERS_TIMELINE4=$covers_timeline4"
+[ "$timeline" = "4" ] || exit 21
+[ "$covers_timeline4" = "t" ] || exit 22
 
 # PostgreSQL has already parsed this postmaster GUC with base 0. Verify that
 # the extension consumes the parsed numeric target instead of parsing it again.
+run_as_postgres "$BIN/pg_ctl -D '$CANDIDATE' -m fast -w stop" >/dev/null
 run_as_postgres "$BIN/pg_ctl -D '$VOTER' -m immediate -w stop" >/dev/null
 cat >>"$VOTER/postgresql.auto.conf" <<EOF
 recovery_target_timeline = '0x2'
@@ -159,9 +207,13 @@ EOF
 chown postgres:postgres "$VOTER/postgresql.auto.conf"
 run_as_postgres "$BIN/pg_ctl -D '$VOTER' -l '$ROOT/voter.log' -w start" >/dev/null
 numeric_result="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -AtF '|' -v ON_ERROR_STOP=1 -c 'SELECT timeline, flush_lsn FROM lwaldump_with_timeline()'")"
+numeric_timeline="${numeric_result%%|*}"
+numeric_flush_lsn="${numeric_result#*|}"
+numeric_covers_timeline2="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -Atc \"SELECT '$numeric_flush_lsn'::pg_lsn >= '$timeline2_end'::pg_lsn\"")"
 
 echo "NUMERIC_RECOVERY_TARGET_OUTPUT=$numeric_result"
-[ "$numeric_result" = "$result" ] || exit 23
+[ "$numeric_timeline" = "2" ] || exit 23
+[ "$numeric_covers_timeline2" = "t" ] || exit 30
 
 # Without the child's copy of the segment that contains the fork, only the
 # parent up to the switchpoint is reachable. Never read its divergent tail.
