@@ -129,22 +129,6 @@ while :; do
     sleep 0.25
 done
 
-# Fence the external WAL source before every lwaldump call. PostgreSQL keeps
-# the last received timeline in shared memory after walreceiver has stopped.
-cat >>"$VOTER/postgresql.auto.conf" <<EOF
-primary_conninfo = ''
-EOF
-chown postgres:postgres "$VOTER/postgresql.auto.conf"
-run_as_postgres "$BIN/pg_ctl -D '$VOTER' reload" >/dev/null
-i=0
-while :; do
-    receivers="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -Atc 'SELECT count(*) FROM pg_stat_wal_receiver'")"
-    [ "$receivers" = "0" ] && break
-    i=$((i + 1))
-    [ "$i" -lt 80 ] || { echo "voter WAL receiver did not stop"; exit 28; }
-    sleep 0.25
-done
-
 cat >>"$BRANCH3/postgresql.conf" <<EOF
 port = 55445
 listen_addresses = ''
@@ -184,6 +168,25 @@ run_as_postgres "$BIN/pg_ctl -D '$BRANCH4' -w promote" >/dev/null
 run_as_postgres "$BIN/psql -h '$BRANCH4_SOCKET' -p 55446 -d postgres -v ON_ERROR_STOP=1 -c \"INSERT INTO wal_payload VALUES (51002, repeat(md5('branch4'), 12))\"" >/dev/null
 timeline4_end="$(run_as_postgres "$BIN/psql -h '$BRANCH4_SOCKET' -p 55446 -d postgres -Atc 'SELECT pg_current_wal_flush_lsn()'")"
 run_as_postgres "$BIN/pg_ctl -D '$BRANCH4' -m fast -w stop" >/dev/null
+
+# Fence the external WAL source before every lwaldump call. Reloading an empty
+# primary_conninfo prevents a reconnect; stopping the upstream makes the
+# currently paused walreceiver exit. Its last received timeline remains in
+# shared memory.
+cat >>"$VOTER/postgresql.auto.conf" <<EOF
+primary_conninfo = ''
+EOF
+chown postgres:postgres "$VOTER/postgresql.auto.conf"
+run_as_postgres "$BIN/pg_ctl -D '$VOTER' reload" >/dev/null
+run_as_postgres "$BIN/pg_ctl -D '$CANDIDATE' -m fast -w stop" >/dev/null
+i=0
+while :; do
+    receivers="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -Atc 'SELECT count(*) FROM pg_stat_wal_receiver'")"
+    [ "$receivers" = "0" ] && break
+    i=$((i + 1))
+    [ "$i" -lt 80 ] || { echo "voter WAL receiver did not stop"; exit 28; }
+    sleep 0.25
+done
 
 [ "$(awk 'END { print $1 }' "$BRANCH3/pg_wal/00000003.history")" = "2" ] || exit 31
 [ "$(awk 'END { print $1 }' "$BRANCH4/pg_wal/00000004.history")" = "2" ] || exit 32
@@ -240,7 +243,6 @@ echo "INCOMPATIBLE_NEWEST_OUTPUT=$newest_output"
 
 # PostgreSQL has already parsed this postmaster GUC with base 0. Verify that
 # the extension consumes the parsed numeric target instead of parsing it again.
-run_as_postgres "$BIN/pg_ctl -D '$CANDIDATE' -m fast -w stop" >/dev/null
 run_as_postgres "$BIN/pg_ctl -D '$VOTER' -m immediate -w stop" >/dev/null
 cat >>"$VOTER/postgresql.auto.conf" <<EOF
 recovery_target_timeline = '0x2'
