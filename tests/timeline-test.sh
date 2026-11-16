@@ -84,12 +84,7 @@ run_as_postgres "$BIN/pg_ctl -D '$CANDIDATE' -w promote" >/dev/null
 
 run_as_postgres "$BIN/psql -h '$CANDIDATE_SOCKET' -p 55443 -d postgres -v ON_ERROR_STOP=1 -c \"INSERT INTO wal_payload SELECT g, repeat(md5(g::text), 12) FROM generate_series(50001, 51000) AS g\"" >/dev/null
 timeline2_end="$(run_as_postgres "$BIN/psql -h '$CANDIDATE_SOCKET' -p 55443 -d postgres -Atc 'SELECT pg_current_wal_flush_lsn()'")"
-run_as_postgres "$BIN/pg_ctl -D '$CANDIDATE' -m fast -w stop" >/dev/null
 
-cp "$WAL_ARCHIVE"/00000001* "$VOTER/pg_wal/"
-cp "$CANDIDATE"/pg_wal/0000000* "$VOTER/pg_wal/"
-chown postgres:postgres "$VOTER"/pg_wal/0000000*
-switchpoint="$(awk 'NR == 1 { print $2 }' "$VOTER/pg_wal/00000002.history")"
 cat >>"$VOTER/postgresql.conf" <<EOF
 port = 55444
 listen_addresses = ''
@@ -97,15 +92,52 @@ unix_socket_directories = '$VOTER_SOCKET'
 hot_standby = on
 restore_command = ''
 recovery_target_timeline = 'latest'
-recovery_min_apply_delay = '1h'
+recovery_target_lsn = '$fork_lsn'
+recovery_target_action = 'pause'
 EOF
 cat >>"$VOTER/postgresql.auto.conf" <<EOF
-primary_conninfo = ''
+primary_conninfo = 'host=$CANDIDATE_SOCKET port=55443 user=postgres dbname=postgres'
 EOF
 chown postgres:postgres "$VOTER/postgresql.conf" "$VOTER/postgresql.auto.conf"
 run_as_postgres "$BIN/pg_ctl -D '$VOTER' -l '$ROOT/voter.log' -w start" >/dev/null
+
+i=0
+while :; do
+    replay_paused="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -Atc 'SELECT pg_is_wal_replay_paused()'")"
+    [ "$replay_paused" = "t" ] && break
+    i=$((i + 1))
+    [ "$i" -lt 240 ] || { echo "voter did not pause recovery at $fork_lsn"; exit 29; }
+    sleep 0.25
+done
+
+i=0
+while :; do
+    received_timeline2="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -Atc \"SELECT COALESCE(pg_last_wal_receive_lsn() >= '$timeline2_end'::pg_lsn, false)\"")"
+    [ "$received_timeline2" = "t" ] && break
+    i=$((i + 1))
+    [ "$i" -lt 240 ] || { echo "voter did not receive timeline 2 through $timeline2_end"; exit 27; }
+    sleep 0.25
+done
+
+run_as_postgres "$BIN/pg_ctl -D '$CANDIDATE' -m fast -w stop" >/dev/null
+i=0
+while :; do
+    receivers="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -Atc 'SELECT count(*) FROM pg_stat_wal_receiver'")"
+    [ "$receivers" = "0" ] && break
+    i=$((i + 1))
+    [ "$i" -lt 80 ] || { echo "voter WAL receiver did not stop"; exit 28; }
+    sleep 0.25
+done
+
+switchpoint="$(awk 'NR == 1 { print $2 }' "$VOTER/pg_wal/00000002.history")"
 switch_offset="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -Atc \"SELECT pg_wal_lsn_diff('$switchpoint', '0/0')::numeric % pg_size_bytes(current_setting('wal_segment_size'))\"")"
 [ "$switch_offset" = "0" ] || { echo "timeline switchpoint is not at a segment boundary: $switchpoint"; exit 26; }
+
+# A sibling history appears after PostgreSQL has already selected timeline 2.
+# It must not redirect an extension scan that starts while replay is on the
+# common timeline 1.
+printf '1\t%s\tsibling timeline\n' "$switchpoint" >"$VOTER/pg_wal/00000003.history"
+chown postgres:postgres "$VOTER/pg_wal/00000003.history"
 
 result="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -AtF '|' -v ON_ERROR_STOP=1 -c 'SELECT timeline, flush_lsn FROM lwaldump_with_timeline()'")"
 timeline="${result%%|*}"

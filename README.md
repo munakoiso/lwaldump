@@ -26,6 +26,13 @@ position recovery can reach from WAL already present in `pg_wal` after
 external WAL sources have been fenced. This binds a failover vote's timeline
 to its exact local WAL position.
 
+For `recovery_target_timeline = latest`, the scan anchors the path to the last
+timeline selected by walreceiver; that shared state remains available after
+the receiver stops. Newer histories are followed only when they descend from
+that path. If no receiver established a path and local histories describe
+multiple sibling branches, the function fails instead of choosing one by its
+timeline number.
+
 The caller must stop walreceiver and archive restore before taking a failover
 vote. If PostgreSQL's recovery target timeline changes during the scan, the
 function fails and the caller must retry.

@@ -32,6 +32,7 @@
 #endif
 #include "access/transam.h"
 #include "miscadmin.h"
+#include "replication/walreceiver.h"
 
 PG_MODULE_MAGIC;
 
@@ -284,9 +285,66 @@ find_local_wal_end(XLogDumpPrivate *private)
 	return (last_segno + 1) * WalSegSz;
 }
 
+static bool
+timeline_contains_point(TimeLineID timeline, XLogRecPtr lsn, List *history)
+{
+	XLogRecPtr	switchpoint;
+
+	if (!tliInHistory(timeline, history))
+		return false;
+
+	switchpoint = tliSwitchPoint(timeline, history, NULL);
+	return switchpoint == InvalidXLogRecPtr || switchpoint >= lsn;
+}
+
+/*
+ * Follow "latest" from the timeline selected by PostgreSQL's WAL receiver.
+ * Its shared state survives fencing, unlike recoveryTargetTLI, which belongs
+ * to the startup process and is not visible in this SQL backend.
+ */
+static TimeLineID
+find_latest_recovery_target(TimeLineID replay_tli, XLogRecPtr replay_lsn)
+{
+	TimeLineID	current_tli = replay_tli;
+	TimeLineID	receive_tli = 0;
+	TimeLineID	newest_tli;
+	TimeLineID	probe_tli;
+	XLogRecPtr	receive_lsn;
+	bool		path_is_known = false;
+	List	   *history;
+
+	receive_lsn = GetWalRcvFlushRecPtr(NULL, &receive_tli);
+	if (receive_tli != 0 && receive_lsn >= replay_lsn)
+	{
+		history = readTimeLineHistory(receive_tli);
+		if (timeline_contains_point(replay_tli, replay_lsn, history))
+		{
+			current_tli = receive_tli;
+			path_is_known = receive_tli != replay_tli;
+		}
+		list_free_deep(history);
+	}
+
+	newest_tli = findNewestTimeLine(current_tli);
+	for (probe_tli = current_tli + 1; probe_tli <= newest_tli; probe_tli++)
+	{
+		history = readTimeLineHistory(probe_tli);
+		if (timeline_contains_point(current_tli, replay_lsn, history))
+			current_tli = probe_tli;
+		else if (!path_is_known &&
+				 timeline_contains_point(replay_tli, replay_lsn, history))
+			elog(ERROR, "could not determine recovery path: timelines %u and %u are siblings",
+				 current_tli, probe_tli);
+		list_free_deep(history);
+	}
+
+	return current_tli;
+}
+
 /* Resolve the recovery target from PostgreSQL's parsed postmaster GUC state. */
 static TimeLineID
-find_recovery_target_tli(TimeLineID replay_tli, bool *target_is_latest)
+find_recovery_target_tli(TimeLineID replay_tli, XLogRecPtr replay_lsn,
+						 bool *target_is_latest)
 {
 	*target_is_latest = false;
 
@@ -296,7 +354,7 @@ find_recovery_target_tli(TimeLineID replay_tli, bool *target_is_latest)
 			return replay_tli;
 		case RECOVERY_TARGET_TIMELINE_LATEST:
 			*target_is_latest = true;
-			return findNewestTimeLine(replay_tli);
+			return find_latest_recovery_target(replay_tli, replay_lsn);
 		case RECOVERY_TARGET_TIMELINE_NUMERIC:
 			return recoveryTargetTLIRequested;
 	}
@@ -411,7 +469,8 @@ lwaldump_scan(TimeLineID *timeline)
 	if (XLogRecPtrIsInvalid(private.startptr))
 		elog(ERROR, "no replay WAL location available");
 
-	target_tli = find_recovery_target_tli(replay_tli, &target_is_latest);
+	target_tli = find_recovery_target_tli(replay_tli, private.startptr,
+									  &target_is_latest);
 	private.history = readTimeLineHistory(target_tli);
 	if (!tliInHistory(replay_tli, private.history))
 		elog(ERROR, "replay timeline %u is not in target timeline %u history",
@@ -481,7 +540,8 @@ lwaldump_scan(TimeLineID *timeline)
 
 	XLogReaderFree(xlogreader_state);
 
-	if (target_is_latest && findNewestTimeLine(replay_tli) != target_tli)
+	if (target_is_latest &&
+		find_latest_recovery_target(replay_tli, private.startptr) != target_tli)
 		elog(ERROR, "new recovery target timeline appeared during WAL scan");
 
 	*timeline = last_tli;
