@@ -15,7 +15,6 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "utils/builtins.h"
-#include "utils/guc.h"
 #include "utils/pg_lsn.h"
 
 #include <dirent.h>
@@ -275,7 +274,7 @@ find_local_wal_end(XLogDumpPrivate *private)
 
 		/* Do not scan an ancestor's copy past its switchpoint. */
 		if (file_history->end != InvalidXLogRecPtr &&
-			file_history->end <= (segno + 1) * WalSegSz)
+			file_history->end < (segno + 1) * WalSegSz)
 			return file_history->end;
 	}
 
@@ -285,32 +284,26 @@ find_local_wal_end(XLogDumpPrivate *private)
 	return (last_segno + 1) * WalSegSz;
 }
 
-/* Resolve the recovery target visible to this SQL backend. */
+/* Resolve the recovery target from PostgreSQL's parsed postmaster GUC state. */
 static TimeLineID
 find_recovery_target_tli(TimeLineID replay_tli, bool *target_is_latest)
 {
-	const char *target;
-	char	   *endptr;
-	unsigned long parsed;
-
-	target = GetConfigOption("recovery_target_timeline", false, false);
 	*target_is_latest = false;
 
-	if (strcmp(target, "current") == 0)
-		return replay_tli;
-	if (strcmp(target, "latest") == 0)
+	switch (recoveryTargetTimeLineGoal)
 	{
-		*target_is_latest = true;
-		return findNewestTimeLine(replay_tli);
+		case RECOVERY_TARGET_TIMELINE_CONTROLFILE:
+			return replay_tli;
+		case RECOVERY_TARGET_TIMELINE_LATEST:
+			*target_is_latest = true;
+			return findNewestTimeLine(replay_tli);
+		case RECOVERY_TARGET_TIMELINE_NUMERIC:
+			return recoveryTargetTLIRequested;
 	}
 
-	errno = 0;
-	parsed = strtoul(target, &endptr, 10);
-	if (errno != 0 || *endptr != '\0' || parsed == 0 ||
-		parsed > (unsigned long) ((TimeLineID) -1))
-		elog(ERROR, "invalid recovery target timeline: \"%s\"", target);
-
-	return (TimeLineID) parsed;
+	elog(ERROR, "unrecognized recovery target timeline goal: %d",
+		 (int) recoveryTargetTimeLineGoal);
+	return 0;
 }
 
 /* lwaldump's XLogReaderRoutine->segment_open callback */

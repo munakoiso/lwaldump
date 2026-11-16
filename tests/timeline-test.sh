@@ -56,7 +56,10 @@ chown postgres:postgres "$CANDIDATE/postgresql.conf"
 run_as_postgres "$BIN/pg_ctl -D '$CANDIDATE' -l '$ROOT/candidate.log' -w start" >/dev/null
 
 run_as_postgres "$BIN/psql -h '$PRIMARY_SOCKET' -p 55442 -d postgres -v ON_ERROR_STOP=1 -c \"INSERT INTO wal_payload SELECT g, repeat(md5(g::text), 12) FROM generate_series(1, 50000) AS g\"" >/dev/null
+run_as_postgres "$BIN/psql -h '$PRIMARY_SOCKET' -p 55442 -d postgres -v ON_ERROR_STOP=1 -c 'SELECT pg_switch_wal()'" >/dev/null
 fork_lsn="$(run_as_postgres "$BIN/psql -h '$PRIMARY_SOCKET' -p 55442 -d postgres -Atc 'SELECT pg_current_wal_flush_lsn()'")"
+fork_offset="$(run_as_postgres "$BIN/psql -h '$PRIMARY_SOCKET' -p 55442 -d postgres -Atc \"SELECT pg_wal_lsn_diff('$fork_lsn', '0/0')::numeric % pg_size_bytes(current_setting('wal_segment_size'))\"")"
+[ "$fork_offset" = "0" ] || { echo "timeline switch target is not at a segment boundary: $fork_lsn"; exit 19; }
 
 i=0
 while :; do
@@ -68,9 +71,15 @@ while :; do
 done
 
 # Promotion may recycle parent-timeline segments, so retain their local copies.
+run_as_postgres "$BIN/pg_ctl -D '$CANDIDATE' -m immediate -w stop" >/dev/null
+cat >>"$CANDIDATE/postgresql.auto.conf" <<EOF
+primary_conninfo = ''
+EOF
+chown postgres:postgres "$CANDIDATE/postgresql.auto.conf"
 cp "$CANDIDATE"/pg_wal/00000001* "$WAL_ARCHIVE/"
 
 run_as_postgres "$BIN/pg_ctl -D '$PRIMARY' -m fast -w stop" >/dev/null
+run_as_postgres "$BIN/pg_ctl -D '$CANDIDATE' -l '$ROOT/candidate.log' -w start" >/dev/null
 run_as_postgres "$BIN/pg_ctl -D '$CANDIDATE' -w promote" >/dev/null
 
 run_as_postgres "$BIN/psql -h '$CANDIDATE_SOCKET' -p 55443 -d postgres -v ON_ERROR_STOP=1 -c \"INSERT INTO wal_payload SELECT g, repeat(md5(g::text), 12) FROM generate_series(50001, 51000) AS g\"" >/dev/null
@@ -80,6 +89,7 @@ run_as_postgres "$BIN/pg_ctl -D '$CANDIDATE' -m fast -w stop" >/dev/null
 cp "$WAL_ARCHIVE"/00000001* "$VOTER/pg_wal/"
 cp "$CANDIDATE"/pg_wal/0000000* "$VOTER/pg_wal/"
 chown postgres:postgres "$VOTER"/pg_wal/0000000*
+switchpoint="$(awk 'NR == 1 { print $2 }' "$VOTER/pg_wal/00000002.history")"
 cat >>"$VOTER/postgresql.conf" <<EOF
 port = 55444
 listen_addresses = ''
@@ -94,6 +104,8 @@ primary_conninfo = ''
 EOF
 chown postgres:postgres "$VOTER/postgresql.conf" "$VOTER/postgresql.auto.conf"
 run_as_postgres "$BIN/pg_ctl -D '$VOTER' -l '$ROOT/voter.log' -w start" >/dev/null
+switch_offset="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -Atc \"SELECT pg_wal_lsn_diff('$switchpoint', '0/0')::numeric % pg_size_bytes(current_setting('wal_segment_size'))\"")"
+[ "$switch_offset" = "0" ] || { echo "timeline switchpoint is not at a segment boundary: $switchpoint"; exit 26; }
 
 result="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -AtF '|' -v ON_ERROR_STOP=1 -c 'SELECT timeline, flush_lsn FROM lwaldump_with_timeline()'")"
 timeline="${result%%|*}"
@@ -106,17 +118,29 @@ echo "COVERS_TIMELINE2=$covers_timeline2"
 [ "$timeline" = "2" ] || exit 21
 [ "$covers_timeline2" = "t" ] || exit 22
 
+# PostgreSQL has already parsed this postmaster GUC with base 0. Verify that
+# the extension consumes the parsed numeric target instead of parsing it again.
+run_as_postgres "$BIN/pg_ctl -D '$VOTER' -m immediate -w stop" >/dev/null
+cat >>"$VOTER/postgresql.auto.conf" <<EOF
+recovery_target_timeline = '0x2'
+EOF
+chown postgres:postgres "$VOTER/postgresql.auto.conf"
+run_as_postgres "$BIN/pg_ctl -D '$VOTER' -l '$ROOT/voter.log' -w start" >/dev/null
+numeric_result="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -AtF '|' -v ON_ERROR_STOP=1 -c 'SELECT timeline, flush_lsn FROM lwaldump_with_timeline()'")"
+
+echo "NUMERIC_RECOVERY_TARGET_OUTPUT=$numeric_result"
+[ "$numeric_result" = "$result" ] || exit 23
+
 # Without the child's copy of the segment that contains the fork, only the
 # parent up to the switchpoint is reachable. Never read its divergent tail.
 run_as_postgres "$BIN/pg_ctl -D '$VOTER' -m immediate -w stop" >/dev/null
 child_switch_segment="$(find "$VOTER/pg_wal" -maxdepth 1 -type f \
     -name '00000002*' ! -name '*.history' | sort | head -n 1)"
-[ -n "$child_switch_segment" ] || exit 23
+[ -n "$child_switch_segment" ] || exit 24
 mv "$child_switch_segment" "$child_switch_segment.saved"
-switchpoint="$(awk 'NR == 1 { print $2 }' "$VOTER/pg_wal/00000002.history")"
 run_as_postgres "$BIN/pg_ctl -D '$VOTER' -l '$ROOT/voter.log' -w start" >/dev/null
 fallback_result="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -AtF '|' -v ON_ERROR_STOP=1 -c 'SELECT timeline, flush_lsn FROM lwaldump_with_timeline()'")"
 
 echo "MISSING_CHILD_SWITCH_SEGMENT_OUTPUT=$fallback_result"
 echo "SWITCHPOINT=$switchpoint"
-[ "$fallback_result" = "1|$switchpoint" ] || exit 24
+[ "$fallback_result" = "1|$switchpoint" ] || exit 25
