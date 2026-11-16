@@ -298,9 +298,10 @@ timeline_contains_point(TimeLineID timeline, XLogRecPtr lsn, List *history)
 }
 
 /*
- * Follow "latest" from the timeline selected by PostgreSQL's WAL receiver.
- * Its shared state survives fencing, unlike recoveryTargetTLI, which belongs
- * to the startup process and is not visible in this SQL backend.
+ * Infer "latest" conservatively.  The WAL receiver's timeline is only an
+ * ancestor that PostgreSQL has streamed; it does not expose recoveryTargetTLI,
+ * which belongs to the startup process.  Reject histories for which different
+ * arrival orders could leave PostgreSQL on different recovery targets.
  */
 static TimeLineID
 find_latest_recovery_target(TimeLineID replay_tli, XLogRecPtr replay_lsn)
@@ -311,7 +312,7 @@ find_latest_recovery_target(TimeLineID replay_tli, XLogRecPtr replay_lsn)
 	TimeLineID	newest_tli;
 	TimeLineID	probe_tli;
 	XLogRecPtr	receive_lsn;
-	bool		receiver_path_is_known = false;
+	bool		newest_is_on_anchor_path = true;
 	List	   *history;
 
 	receive_lsn = GetWalRcvFlushRecPtr(NULL, &receive_tli);
@@ -319,30 +320,38 @@ find_latest_recovery_target(TimeLineID replay_tli, XLogRecPtr replay_lsn)
 	{
 		history = readTimeLineHistory(receive_tli);
 		if (timeline_contains_point(replay_tli, replay_lsn, history))
-		{
 			anchor_tli = receive_tli;
-			receiver_path_is_known = true;
-		}
 		list_free_deep(history);
 	}
 
 	selected_tli = anchor_tli;
 	newest_tli = findNewestTimeLine(anchor_tli);
-	/* Compare every candidate with the fixed PostgreSQL recovery path. */
+	/* Compare every candidate with the fixed timeline known to be reachable. */
 	for (probe_tli = anchor_tli + 1; probe_tli <= newest_tli; probe_tli++)
 	{
+		bool		on_anchor_path;
+
 		history = readTimeLineHistory(probe_tli);
-		if (timeline_contains_point(anchor_tli, replay_lsn, history))
+		on_anchor_path = timeline_contains_point(anchor_tli, replay_lsn,
+											 history);
+		if (probe_tli == newest_tli)
+			newest_is_on_anchor_path = on_anchor_path;
+
+		if (on_anchor_path)
 		{
-			if (receiver_path_is_known || selected_tli == anchor_tli ||
+			if (selected_tli == anchor_tli ||
 				timeline_contains_point(selected_tli, replay_lsn, history))
 				selected_tli = probe_tli;
 			else
-				elog(ERROR, "could not determine recovery path: timelines %u and %u are siblings",
-					 selected_tli, probe_tli);
+				elog(ERROR, "could not determine recovery path: timelines %u and %u are sibling descendants of timeline %u",
+					 selected_tli, probe_tli, anchor_tli);
 		}
 		list_free_deep(history);
 	}
+
+	if (selected_tli != anchor_tli && !newest_is_on_anchor_path)
+		elog(ERROR, "could not determine recovery path: timeline %u descends from timeline %u, but newest timeline %u does not",
+			 selected_tli, anchor_tli, newest_tli);
 
 	return selected_tli;
 }

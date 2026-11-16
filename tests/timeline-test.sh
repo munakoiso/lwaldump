@@ -129,6 +129,22 @@ while :; do
     sleep 0.25
 done
 
+# Fence the external WAL source before every lwaldump call. PostgreSQL keeps
+# the last received timeline in shared memory after walreceiver has stopped.
+cat >>"$VOTER/postgresql.auto.conf" <<EOF
+primary_conninfo = ''
+EOF
+chown postgres:postgres "$VOTER/postgresql.auto.conf"
+run_as_postgres "$BIN/pg_ctl -D '$VOTER' reload" >/dev/null
+i=0
+while :; do
+    receivers="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -Atc 'SELECT count(*) FROM pg_stat_wal_receiver'")"
+    [ "$receivers" = "0" ] && break
+    i=$((i + 1))
+    [ "$i" -lt 80 ] || { echo "voter WAL receiver did not stop"; exit 28; }
+    sleep 0.25
+done
+
 cat >>"$BRANCH3/postgresql.conf" <<EOF
 port = 55445
 listen_addresses = ''
@@ -172,30 +188,55 @@ run_as_postgres "$BIN/pg_ctl -D '$BRANCH4' -m fast -w stop" >/dev/null
 [ "$(awk 'END { print $1 }' "$BRANCH3/pg_wal/00000003.history")" = "2" ] || exit 31
 [ "$(awk 'END { print $1 }' "$BRANCH4/pg_wal/00000004.history")" = "2" ] || exit 32
 cp "$BRANCH3"/pg_wal/00000003* "$VOTER/pg_wal/"
-cp "$BRANCH4"/pg_wal/00000004* "$VOTER/pg_wal/"
-chown postgres:postgres "$VOTER"/pg_wal/00000003* "$VOTER"/pg_wal/00000004*
+chown postgres:postgres "$VOTER"/pg_wal/00000003*
 
 switchpoint="$(awk 'NR == 1 { print $2 }' "$VOTER/pg_wal/00000002.history")"
 switch_offset="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -Atc \"SELECT pg_wal_lsn_diff('$switchpoint', '0/0')::numeric % pg_size_bytes(current_setting('wal_segment_size'))\"")"
 [ "$switch_offset" = "0" ] || { echo "timeline switchpoint is not at a segment boundary: $switchpoint"; exit 26; }
 
-# An unrelated sibling appears after PostgreSQL has selected timeline 2. It
-# must not redirect a scan whose replay position is still on common timeline 1.
-printf '1\t%s\tunrelated sibling timeline\n' "$switchpoint" >"$VOTER/pg_wal/00000005.history"
-chown postgres:postgres "$VOTER/pg_wal/00000005.history"
-
 result="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -AtF '|' -v ON_ERROR_STOP=1 -c 'SELECT timeline, flush_lsn FROM lwaldump_with_timeline()'")"
 timeline="${result%%|*}"
 flush_lsn="${result#*|}"
-covers_timeline4="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -Atc \"SELECT '$flush_lsn'::pg_lsn >= '$timeline4_end'::pg_lsn\"")"
+covers_timeline3="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -Atc \"SELECT '$flush_lsn'::pg_lsn >= '$timeline3_end'::pg_lsn\"")"
 
 echo "RECOVERY_PATH_OUTPUT=$result"
 echo "TIMELINE2_END=$timeline2_end"
 echo "TIMELINE3_END=$timeline3_end"
 echo "TIMELINE4_END=$timeline4_end"
-echo "COVERS_TIMELINE4=$covers_timeline4"
-[ "$timeline" = "4" ] || exit 21
-[ "$covers_timeline4" = "t" ] || exit 22
+echo "COVERS_TIMELINE3=$covers_timeline3"
+[ "$timeline" = "3" ] || exit 21
+[ "$covers_timeline3" = "t" ] || exit 22
+
+# receivedTLI=2 does not reveal whether PostgreSQL has already selected 3.
+# When another child of 2 appears, either 3 or 4 can be the actual target.
+cp "$BRANCH4"/pg_wal/00000004* "$VOTER/pg_wal/"
+chown postgres:postgres "$VOTER"/pg_wal/00000004*
+if sibling_output="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -AtF '|' -v ON_ERROR_STOP=1 -c 'SELECT timeline, flush_lsn FROM lwaldump_with_timeline()'" 2>&1)"; then
+    echo "expected sibling recovery paths to be rejected"
+    exit 33
+fi
+case "$sibling_output" in
+    *"could not determine recovery path"*) ;;
+    *) echo "$sibling_output"; exit 34 ;;
+esac
+echo "SIBLING_RECOVERY_PATH_OUTPUT=$sibling_output"
+
+# Now make timeline 4 a child of 3 and add a newer history unrelated to 2.
+# PostgreSQL may still target 2, or may already have advanced through 3 to 4;
+# the startup process is the only process that knows which ordering occurred.
+cp "$VOTER/pg_wal/00000003.history" "$VOTER/pg_wal/00000004.history"
+printf '3\t%s\tdescendant timeline\n' "$timeline3_end" >>"$VOTER/pg_wal/00000004.history"
+printf '1\t%s\tunrelated newest timeline\n' "$switchpoint" >"$VOTER/pg_wal/00000005.history"
+chown postgres:postgres "$VOTER/pg_wal/00000004.history" "$VOTER/pg_wal/00000005.history"
+if newest_output="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -AtF '|' -v ON_ERROR_STOP=1 -c 'SELECT timeline, flush_lsn FROM lwaldump_with_timeline()'" 2>&1)"; then
+    echo "expected an incompatible newest timeline to be rejected"
+    exit 35
+fi
+case "$newest_output" in
+    *"could not determine recovery path"*) ;;
+    *) echo "$newest_output"; exit 36 ;;
+esac
+echo "INCOMPATIBLE_NEWEST_OUTPUT=$newest_output"
 
 # PostgreSQL has already parsed this postmaster GUC with base 0. Verify that
 # the extension consumes the parsed numeric target instead of parsing it again.
