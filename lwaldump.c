@@ -15,8 +15,8 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "utils/builtins.h"
-#include "utils/pg_lsn.h"
 #include "utils/guc.h"
+#include "utils/pg_lsn.h"
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -43,77 +43,13 @@ static int	WalSegSz;
 
 typedef struct XLogDumpPrivate
 {
-	TimeLineID	timeline;
-	TimeLineHistoryEntry *history;
-	int			history_count;
 	char	   *inpath;
 	XLogRecPtr	startptr;
 	XLogRecPtr	endptr;
 	bool		endptr_reached;
+	List	   *history;
+	TimeLineID	current_file_tli;
 } XLogDumpPrivate;
-
-/* Read a history file from pg_wal only; PostgreSQL's helper may restore one. */
-static bool
-read_local_history(const char *directory, TimeLineID target,
-				   TimeLineHistoryEntry **entries, int *count)
-{
-	char		name[MAXFNAMELEN];
-	char		path[MAXPGPATH];
-	char		line[1024];
-	FILE	   *file;
-	TimeLineHistoryEntry *result = NULL;
-	int			n = 0;
-	int			capacity = 0;
-	XLogRecPtr	begin = InvalidXLogRecPtr;
-	TimeLineID	previous = 0;
-
-	TLHistoryFileName(name, target);
-	snprintf(path, sizeof(path), "%s/%s", directory, name);
-	file = fopen(path, "r");
-	if (file == NULL)
-	{
-		if (errno == ENOENT)
-			return false;
-		elog(ERROR, "could not open timeline history file \"%s\": %m", path);
-	}
-
-	while (fgets(line, sizeof(line), file) != NULL)
-	{
-		unsigned int parent, hi, lo;
-		XLogRecPtr switchpoint;
-
-		if (line[0] == '#' || line[0] == '\n')
-			continue;
-		if (sscanf(line, "%u\t%X/%X", &parent, &hi, &lo) != 3)
-			elog(ERROR, "invalid timeline history file \"%s\"", path);
-		switchpoint = ((uint64) hi << 32) | lo;
-		if (parent <= previous || parent >= target || switchpoint <= begin)
-			elog(ERROR, "inconsistent timeline history file \"%s\"", path);
-		if (n == capacity)
-		{
-			capacity = capacity ? capacity * 2 : 4;
-			result = result ? repalloc(result, capacity * sizeof(*result)) : palloc(capacity * sizeof(*result));
-		}
-		result[n].tli = parent;
-		result[n].begin = begin;
-		result[n].end = switchpoint;
-		n++;
-		previous = parent;
-		begin = switchpoint;
-	}
-	if (ferror(file))
-		elog(ERROR, "could not read timeline history file \"%s\": %m", path);
-	fclose(file);
-	if (n == 0)
-		elog(ERROR, "empty timeline history file \"%s\"", path);
-	result = repalloc(result, (n + 1) * sizeof(*result));
-	result[n].tli = target;
-	result[n].begin = begin;
-	result[n].end = InvalidXLogRecPtr;
-	*entries = result;
-	*count = n + 1;
-	return true;
-}
 
 
 /*
@@ -262,153 +198,119 @@ identify_target_directory(XLogDumpPrivate *private)
 	elog(ERROR, "could not find any WAL file");
 }
 
+/* Open the newest usable local copy of a segment on the recovery path. */
+static int
+open_segment_from_history(XLogDumpPrivate *private, XLogSegNo segno,
+						  TimeLineID min_tli, TimeLineID *file_tli,
+						  TimeLineHistoryEntry **file_history)
+{
+	ListCell   *cell;
+
+	foreach(cell, private->history)
+	{
+		TimeLineHistoryEntry *entry = (TimeLineHistoryEntry *) lfirst(cell);
+		char		fname[MAXPGPATH];
+		int			fd;
+
+		if (entry->tli < min_tli)
+			break;
+
+		if (entry->begin != InvalidXLogRecPtr)
+		{
+			XLogSegNo	beginseg;
+
+			XLByteToSeg(entry->begin, beginseg, WalSegSz);
+			if (segno < beginseg)
+				continue;
+		}
+		if (entry->end != InvalidXLogRecPtr)
+		{
+			XLogSegNo	endseg;
+
+			XLByteToSeg(entry->end, endseg, WalSegSz);
+			if (segno > endseg)
+				continue;
+		}
+
+		XLogFileName(fname, entry->tli, segno, WalSegSz);
+		fd = open_file_in_directory(private->inpath, fname);
+		if (fd >= 0)
+		{
+			*file_tli = entry->tli;
+			if (file_history != NULL)
+				*file_history = entry;
+			return fd;
+		}
+	}
+
+	return -1;
+}
+
 /*
- * Freeze the scan at the end of the newest local segment on this timeline.
- * Without an upper bound XLogReader tries to open the next, absent segment
- * after consuming a segment exactly to its end.
+ * Freeze the scan at the first segment absent from the local recovery path.
+ * A later segment does not make a gap replayable.
  */
 static XLogRecPtr
-find_local_wal_end(const char *directory, TimeLineID timeline)
-{
-	DIR		   *xldir;
-	struct dirent *xlde;
-	XLogSegNo	max_segno = 0;
-	bool		found = false;
-
-	xldir = opendir(directory);
-	if (xldir == NULL)
-		elog(ERROR, "could not open directory \"%s\": %m", directory);
-
-	while ((xlde = readdir(xldir)) != NULL)
-	{
-		TimeLineID	file_timeline;
-		XLogSegNo	segno;
-
-		if (!IsXLogFileName(xlde->d_name))
-			continue;
-
-		XLogFromFileName(xlde->d_name, &file_timeline, &segno, WalSegSz);
-		if (file_timeline == timeline && (!found || segno > max_segno))
-		{
-			max_segno = segno;
-			found = true;
-		}
-	}
-
-	closedir(xldir);
-	if (!found)
-		elog(ERROR, "could not find a WAL file for timeline %u", timeline);
-
-	return (max_segno + 1) * WalSegSz;
-}
-
-static bool
-local_segment_exists(const char *directory, TimeLineID timeline,
-					 XLogSegNo segno)
-{
-	char		name[MAXFNAMELEN];
-	char		path[MAXPGPATH];
-
-	XLogFileName(name, timeline, segno, WalSegSz);
-	snprintf(path, sizeof(path), "%s/%s", directory, name);
-	return access(path, F_OK) == 0;
-}
-
-static void
-find_local_history(XLogDumpPrivate *private)
-{
-	DIR		   *dir;
-	struct dirent *entry;
-	TimeLineID	best = private->timeline;
-	TimeLineID	replay_tli = private->timeline;
-	TimeLineHistoryEntry *best_history = NULL;
-	int			best_count = 0;
-	const char *target_setting = GetConfigOption("recovery_target_timeline", false, false);
-	TimeLineID	target_tli = 0;
-
-	if (strcmp(target_setting, "current") == 0)
-		return;
-	if (strcmp(target_setting, "latest") != 0 &&
-		(sscanf(target_setting, "%u", &target_tli) != 1 || target_tli == 0))
-		elog(ERROR, "invalid recovery_target_timeline: %s", target_setting);
-
-	dir = opendir(private->inpath);
-	if (dir == NULL)
-		elog(ERROR, "could not open directory \"%s\": %m", private->inpath);
-	while ((entry = readdir(dir)) != NULL)
-	{
-		TimeLineID	candidate;
-		TimeLineHistoryEntry *history;
-		int			count;
-		int			i;
-		XLogSegNo	segno;
-
-		if (!IsTLHistoryFileName(entry->d_name) ||
-			sscanf(entry->d_name, "%8X", &candidate) != 1 || candidate <= best)
-			continue;
-		if (target_tli != 0 && candidate != target_tli)
-			continue;
-		if (!read_local_history(private->inpath, candidate, &history, &count))
-			continue;
-		for (i = 0; i < count; i++)
-			if (history[i].tli == replay_tli &&
-				private->startptr >= history[i].begin &&
-				(history[i].end == InvalidXLogRecPtr || private->startptr <= history[i].end))
-				break;
-		if (i == count)
-		{
-			pfree(history);
-			continue;
-		}
-		XLByteToSeg(history[count - 1].begin, segno, WalSegSz);
-		if (!local_segment_exists(private->inpath, candidate, segno))
-		{
-			pfree(history);
-			continue;
-		}
-		if (best_history)
-			pfree(best_history);
-		best_history = history;
-		best_count = count;
-		best = candidate;
-	}
-	closedir(dir);
-	if (best_history)
-	{
-		private->history = best_history;
-		private->history_count = best_count;
-		private->endptr = find_local_wal_end(private->inpath, best);
-	}
-}
-
-static TimeLineID
-timeline_for_segment(XLogDumpPrivate *private, XLogRecPtr pageptr)
+find_local_wal_end(XLogDumpPrivate *private)
 {
 	XLogSegNo	segno;
-	XLogRecPtr	segment_end;
-	int			i;
+	XLogSegNo	last_segno = 0;
+	TimeLineID	file_tli = 0;
+	bool		found = false;
 
-	if (!private->history)
-		return private->timeline;
-	XLByteToSeg(pageptr, segno, WalSegSz);
-	segment_end = (segno + 1) * WalSegSz;
-	for (i = private->history_count - 1; i >= 0; i--)
-		if (private->history[i].begin < segment_end)
-			return private->history[i].tli;
-	return private->history[0].tli;
+	XLByteToSeg(private->startptr, segno, WalSegSz);
+	for (;; segno++)
+	{
+		int			fd;
+		TimeLineHistoryEntry *file_history;
+
+		fd = open_segment_from_history(private, segno, file_tli, &file_tli,
+									   &file_history);
+		if (fd < 0)
+			break;
+
+		close(fd);
+		last_segno = segno;
+		found = true;
+
+		/* Do not scan an ancestor's copy past its switchpoint. */
+		if (file_history->end != InvalidXLogRecPtr &&
+			file_history->end <= (segno + 1) * WalSegSz)
+			return file_history->end;
+	}
+
+	if (!found)
+		return private->startptr;
+
+	return (last_segno + 1) * WalSegSz;
 }
 
+/* Resolve the recovery target visible to this SQL backend. */
 static TimeLineID
-timeline_for_record(XLogDumpPrivate *private, XLogRecPtr recptr)
+find_recovery_target_tli(TimeLineID replay_tli, bool *target_is_latest)
 {
-	int			i;
+	const char *target;
+	char	   *endptr;
+	unsigned long parsed;
 
-	if (!private->history)
-		return private->timeline;
-	for (i = private->history_count - 1; i >= 0; i--)
-		if (private->history[i].begin <= recptr)
-			return private->history[i].tli;
-	return private->history[0].tli;
+	target = GetConfigOption("recovery_target_timeline", false, false);
+	*target_is_latest = false;
+
+	if (strcmp(target, "current") == 0)
+		return replay_tli;
+	if (strcmp(target, "latest") == 0)
+	{
+		*target_is_latest = true;
+		return findNewestTimeLine(replay_tli);
+	}
+
+	errno = 0;
+	parsed = strtoul(target, &endptr, 10);
+	if (errno != 0 || *endptr != '\0' || parsed == 0 ||
+		parsed > (unsigned long) ((TimeLineID) -1))
+		elog(ERROR, "invalid recovery target timeline: \"%s\"", target);
+
+	return (TimeLineID) parsed;
 }
 
 /* lwaldump's XLogReaderRoutine->segment_open callback */
@@ -416,38 +318,16 @@ static void
 WALDumpOpenSegment(XLogReaderState *state, XLogSegNo nextSegNo,
 				   TimeLineID *tli_p)
 {
-	TimeLineID	tli = *tli_p;
-	char		fname[MAXPGPATH];
-	int			tries;
+	XLogDumpPrivate *private = state->private_data;
 
-	XLogFileName(fname, tli, nextSegNo, state->segcxt.ws_segsize);
+	state->seg.ws_file = open_segment_from_history(private, nextSegNo,
+												  private->current_file_tli, tli_p,
+												  NULL);
+	if (state->seg.ws_file < 0)
+		elog(ERROR, "could not find WAL segment %llu on the recovery path",
+			 (unsigned long long) nextSegNo);
 
-	/*
-	 * In follow mode there is a short period of time after the server has
-	 * written the end of the previous file before the new file is available.
-	 * So we loop for 5 seconds looking for the file to appear before giving
-	 * up.
-	 */
-	for (tries = 0; tries < 10; tries++)
-	{
-		state->seg.ws_file = open_file_in_directory(state->segcxt.ws_dir, fname);
-		if (state->seg.ws_file >= 0)
-			return;
-		if (errno == ENOENT)
-		{
-			int			save_errno = errno;
-
-			/* File not there yet, try again */
-			pg_usleep(500 * 1000);
-
-			errno = save_errno;
-			continue;
-		}
-		/* Any other error, fall through and fail */
-		break;
-	}
-
-	elog(ERROR, "could not find file \"%s\": %m", fname);
+	private->current_file_tli = *tli_p;
 }
 
 /*
@@ -470,8 +350,6 @@ WALDumpReadPage(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
 	XLogDumpPrivate *private = state->private_data;
 	int			count = XLOG_BLCKSZ;
 	WALReadError errinfo;
-	TimeLineID	file_timeline;
-	XLogSegNo	segno;
 
 	if (private->endptr != InvalidXLogRecPtr)
 	{
@@ -486,14 +364,8 @@ WALDumpReadPage(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
 		}
 	}
 
-	file_timeline = timeline_for_segment(private, targetPagePtr);
-	XLByteToSeg(targetPagePtr, segno, WalSegSz);
-	if (!local_segment_exists(private->inpath, file_timeline, segno))
-	{
-		private->endptr_reached = true;
-		return -1;
-	}
-	if (!WALRead(state, readBuff, targetPagePtr, count, file_timeline,
+	if (!WALRead(state, readBuff, targetPagePtr, count,
+				 private->current_file_tli,
 				 &errinfo))
 	{
 		WALOpenSegment *seg = &errinfo.wre_seg;
@@ -526,21 +398,38 @@ lwaldump_scan(TimeLineID *timeline)
 	XLogDumpPrivate private;
 	XLogRecord *record;
 	XLogRecPtr	first_record;
+	XLogRecPtr	switchpoint;
+	TimeLineID	replay_tli;
+	TimeLineID	target_tli;
+	TimeLineID	last_tli;
+	bool		target_is_latest;
 	char	   *errormsg;
 
 	memset(&private, 0, sizeof(XLogDumpPrivate));
 
-	private.timeline = 1;
 	private.startptr = InvalidXLogRecPtr;
 	private.endptr = InvalidXLogRecPtr;
 	private.endptr_reached = false;
+	private.history = NIL;
+	private.current_file_tli = 0;
 
 	identify_target_directory(&private);
-	private.startptr = GetXLogReplayRecPtr(&private.timeline);
+	private.startptr = GetXLogReplayRecPtr(&replay_tli);
 	if (XLogRecPtrIsInvalid(private.startptr))
 		elog(ERROR, "no replay WAL location available");
-	private.endptr = find_local_wal_end(private.inpath, private.timeline);
-	find_local_history(&private);
+
+	target_tli = find_recovery_target_tli(replay_tli, &target_is_latest);
+	private.history = readTimeLineHistory(target_tli);
+	if (!tliInHistory(replay_tli, private.history))
+		elog(ERROR, "replay timeline %u is not in target timeline %u history",
+			 replay_tli, target_tli);
+
+	switchpoint = tliSwitchPoint(replay_tli, private.history, NULL);
+	if (switchpoint != InvalidXLogRecPtr && switchpoint < private.startptr)
+		elog(ERROR, "target timeline %u forked from replay timeline %u before the replay position",
+			 target_tli, replay_tli);
+
+	private.endptr = find_local_wal_end(&private);
 
 	/* done with argument parsing, do the actual work */
 
@@ -559,6 +448,7 @@ lwaldump_scan(TimeLineID *timeline)
 	XLogBeginRead(xlogreader_state, first_record);
 
 	last_lsn = private.startptr;
+	last_tli = replay_tli;
 	/*
 	 * Display a message that we're skipping data if `from` wasn't a pointer
 	 * to the start of a record and also wasn't a pointer to the beginning of
@@ -589,17 +479,19 @@ lwaldump_scan(TimeLineID *timeline)
 		/* after reading the first record, continue at next one */
 		first_record = InvalidXLogRecPtr;
 		last_lsn = xlogreader_state->EndRecPtr;
-		private.timeline = timeline_for_record(&private, xlogreader_state->ReadRecPtr);
+		last_tli = tliOfPointInHistory(xlogreader_state->ReadRecPtr,
+										 private.history);
 
 		elog(LOG, "next record is at %X/%X\n", (uint32) (last_lsn >> 32), (uint32) last_lsn);
 	}
 
 
 	XLogReaderFree(xlogreader_state);
-	if (private.history)
-		pfree(private.history);
 
-	*timeline = private.timeline;
+	if (target_is_latest && findNewestTimeLine(replay_tli) != target_tli)
+		elog(ERROR, "new recovery target timeline appeared during WAL scan");
+
+	*timeline = last_tli;
 	return last_lsn;
 }
 
