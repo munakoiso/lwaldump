@@ -22,7 +22,7 @@ jobs:
           - pg_major: 18
             pg_tag: 18-bookworm
           - pg_major: 19
-            pg_tag: 19beta3-bookworm
+            pg_tag: 19rc2-bookworm
     steps:
       - uses: actions/checkout@v4
       - name: Build extension

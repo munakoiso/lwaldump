@@ -17,8 +17,6 @@
 #include "utils/builtins.h"
 #include "utils/pg_lsn.h"
 
-#include <dirent.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #include "access/xlogreader.h"
@@ -26,11 +24,13 @@
 #include "access/htup_details.h"
 #include "access/xlog_internal.h"
 #include "access/xlog.h"
+#include "access/rmgr.h"
 #include "access/timeline.h"
 #if PG_VERSION_NUM >= 150000
 #include "access/xlogrecovery.h"
 #endif
 #include "access/transam.h"
+#include "catalog/pg_control.h"
 #include "miscadmin.h"
 #include "replication/walreceiver.h"
 
@@ -49,6 +49,9 @@ typedef struct XLogDumpPrivate
 	bool		endptr_reached;
 	List	   *history;
 	TimeLineID	current_file_tli;
+	XLogSegNo	current_file_segno;
+	XLogRecPtr	received_upto;
+	TimeLineID	received_tli;
 } XLogDumpPrivate;
 
 
@@ -77,125 +80,62 @@ open_file_in_directory(const char *directory, const char *fname)
 	return fd;
 }
 
-/*
- * Try to find fname in the given directory. Returns true if it is found,
- * false otherwise. If fname is NULL, search the complete directory for any
- * file with a valid WAL file name. If file is successfully opened, set the
- * wal segment size.
- */
+/* A recycled future segment still has the old segment's long header. */
 static bool
-search_directory(const char *directory)
+segment_has_current_wal(int fd, XLogSegNo segno, TimeLineID tli)
 {
-	int			fd = -1;
-	DIR		   *xldir;
-	char *errormsg;
-	char *fname;
+	PGAlignedXLogBlock buf;
+	XLogLongPageHeader longhdr = (XLogLongPageHeader) buf.data;
+	static const char zero_header[sizeof(XLogLongPageHeaderData)] = {0};
+	char		fname[MAXPGPATH];
+	ssize_t		nread;
+	uint32		offset;
+	uint32		i;
 
-	/*
-	 * A valid file name is not passed, so search the complete directory.  If
-	 * we find any file whose name is a valid WAL file name then try to open
-	 * it.  If we cannot open it, bail out.
-	 */
-	if ((xldir = opendir(directory)) != NULL)
+	XLogFileName(fname, tli, segno, WalSegSz);
+	nread = pg_pread(fd, buf.data, sizeof(XLogLongPageHeaderData), 0);
+	if (nread < 0)
+		elog(ERROR, "could not read WAL segment header %s: %m", fname);
+	if (nread != sizeof(XLogLongPageHeaderData))
+		elog(ERROR, "short WAL segment header in %s", fname);
+
+	if (memcmp(buf.data, zero_header, sizeof(zero_header)) == 0)
 	{
-		struct dirent *xlde;
-
-		while ((xlde = readdir(xldir)) != NULL)
+		/* A preallocated empty segment is entirely zero, not just its header. */
+		for (offset = 0; offset < WalSegSz; offset += XLOG_BLCKSZ)
 		{
-			if (IsXLogFileName(xlde->d_name))
-			{
-				fd = open_file_in_directory(directory, xlde->d_name);
-				fname = xlde->d_name;
-				break;
-			}
+			CHECK_FOR_INTERRUPTS();
+			nread = pg_pread(fd, buf.data, XLOG_BLCKSZ, offset);
+			if (nread != XLOG_BLCKSZ)
+				elog(ERROR, "could not inspect empty WAL segment %s at offset %u",
+					 fname, offset);
+			for (i = 0; i < XLOG_BLCKSZ; i++)
+				if (buf.data[i] != 0)
+					elog(ERROR, "nonzero data after zero WAL segment header in %s",
+						 fname);
 		}
-
-		closedir(xldir);
+		return false;
 	}
+	if (longhdr->std.xlp_magic != XLOG_PAGE_MAGIC ||
+		!(longhdr->std.xlp_info & XLP_LONG_HEADER))
+		elog(ERROR, "invalid WAL segment header in %s", fname);
+	if (longhdr->xlp_sysid != GetSystemIdentifier())
+		elog(ERROR, "WAL file is from different database system: %s", fname);
+	if (longhdr->xlp_seg_size != WalSegSz ||
+		longhdr->xlp_xlog_blcksz != XLOG_BLCKSZ)
+		elog(ERROR, "invalid WAL segment size or block size in %s", fname);
+	if (longhdr->std.xlp_pageaddr != segno * WalSegSz)
+		return false;
 
-	/* set WalSegSz if file is successfully opened */
-	if (fd >= 0)
-	{
-		PGAlignedXLogBlock buf;
-		int			r;
-
-		r = read(fd, buf.data, XLOG_BLCKSZ);
-		if (r == XLOG_BLCKSZ)
-		{
-			XLogLongPageHeader longhdr = (XLogLongPageHeader) buf.data;
-
-			WalSegSz = longhdr->xlp_seg_size;
-
-			if (!IsValidWalSegSize(WalSegSz))
-				elog(ERROR, ngettext("WAL segment size must be a power of two between 1 MB and 1 GB, but the WAL file \"%s\" header specifies %d byte",
-									 "WAL segment size must be a power of two between 1 MB and 1 GB, but the WAL file \"%s\" header specifies %d bytes",
-									 WalSegSz),
-							fname, WalSegSz);
-		}
-		else
-		{
-			if (errno != 0) {
-				errormsg = strerror(errno);
-				elog(ERROR, "could not read file \"%s\": %s",
-							fname, errormsg);
-			} else
-				elog(ERROR, "could not read file \"%s\": read %d of %zu",
-							fname, r, (Size) XLOG_BLCKSZ);
-		}
-		close(fd);
-		return true;
-	}
-
-	return false;
+	return true;
 }
 
-/*
- * Identify the target directory and set WalSegSz.
- *
- * Try to find the file in several places:
- * if directory != NULL:
- *	 directory /
- *	 directory / XLOGDIR /
- * else
- *	 .
- *	 XLOGDIR /
- *	 $PGDATA / XLOGDIR /
- *
- * Set the valid target directory in private->inpath.
- */
+/* Use the running server's WAL directory and segment size. */
 static void
 identify_target_directory(XLogDumpPrivate *private)
 {
-	char		fpath[MAXPGPATH];
-	const char *datadir;
-
-	/* current directory */
-	if (search_directory("."))
-	{
-		private->inpath = strdup(".");
-		return;
-	}
-	/* XLOGDIR */
-	if (search_directory(XLOGDIR))
-	{
-		private->inpath = strdup(XLOGDIR);
-		return;
-	}
-
-	datadir = getenv("PGDATA");
-	/* $PGDATA / XLOGDIR */
-	if (datadir != NULL)
-	{
-		snprintf(fpath, MAXPGPATH, "%s/%s", datadir, XLOGDIR);
-		if (search_directory(fpath))
-		{
-			private->inpath = strdup(fpath);
-			return;
-		}
-	}
-
-	/* could not locate WAL file */
-	elog(ERROR, "could not find any WAL file");
+	private->inpath = psprintf("%s/%s", DataDir, XLOGDIR);
+	WalSegSz = wal_segment_size;
 }
 
 /* Open the newest usable local copy of a segment on the recovery path. */
@@ -214,6 +154,10 @@ open_segment_from_history(XLogDumpPrivate *private, XLogSegNo segno,
 
 		if (entry->tli < min_tli)
 			break;
+		/* A segment name can match even after this history entry ended. */
+		if (entry->end != InvalidXLogRecPtr &&
+			entry->end < private->startptr)
+			continue;
 
 		if (entry->begin != InvalidXLogRecPtr)
 		{
@@ -236,6 +180,24 @@ open_segment_from_history(XLogDumpPrivate *private, XLogSegNo segno,
 		fd = open_file_in_directory(private->inpath, fname);
 		if (fd >= 0)
 		{
+			bool		usable;
+
+			PG_TRY();
+			{
+				usable = segment_has_current_wal(fd, segno, entry->tli);
+			}
+			PG_CATCH();
+			{
+				close(fd);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+			if (!usable)
+			{
+				close(fd);
+				continue;
+			}
+
 			*file_tli = entry->tli;
 			if (file_history != NULL)
 				*file_history = entry;
@@ -244,6 +206,24 @@ open_segment_from_history(XLogDumpPrivate *private, XLogSegNo segno,
 	}
 
 	return -1;
+}
+
+/* WAL received on an ancestor after its fork is not on the selected path. */
+static XLogRecPtr
+received_on_path_end(XLogDumpPrivate *private)
+{
+	XLogRecPtr	switchpoint;
+
+	if (private->received_tli == 0 ||
+		!tliInHistory(private->received_tli, private->history))
+		return InvalidXLogRecPtr;
+
+	switchpoint = tliSwitchPoint(private->received_tli,
+									private->history, NULL);
+	if (switchpoint != InvalidXLogRecPtr &&
+		switchpoint < private->received_upto)
+		return switchpoint;
+	return private->received_upto;
 }
 
 /*
@@ -268,8 +248,10 @@ find_local_wal_end(XLogDumpPrivate *private)
 									   &file_history);
 		if (fd < 0)
 			break;
-
 		close(fd);
+		if (file_history->end != InvalidXLogRecPtr &&
+			file_history->end < private->startptr)
+			elog(ERROR, "could not find WAL at the replay position");
 		last_segno = segno;
 		found = true;
 
@@ -280,7 +262,12 @@ find_local_wal_end(XLogDumpPrivate *private)
 	}
 
 	if (!found)
+	{
+		if (XLogSegmentOffset(private->startptr, WalSegSz) != 0 ||
+			received_on_path_end(private) > private->startptr)
+			elog(ERROR, "could not find WAL at the replay position");
 		return private->startptr;
+	}
 
 	return (last_segno + 1) * WalSegSz;
 }
@@ -394,6 +381,7 @@ WALDumpOpenSegment(XLogReaderState *state, XLogSegNo nextSegNo,
 			 (unsigned long long) nextSegNo);
 
 	private->current_file_tli = *tli_p;
+	private->current_file_segno = nextSegNo;
 }
 
 /*
@@ -451,33 +439,239 @@ WALDumpReadPage(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
 						fname, errinfo.wre_off, errinfo.wre_read,
 						(Size) errinfo.wre_req);
 	}
+	if (count >= sizeof(XLogPageHeaderData))
+	{
+		XLogPageHeader header = (XLogPageHeader) readBuff;
+
+		/* Recovery rejects valid WAL pages from outside its history. */
+		if (header->xlp_magic == XLOG_PAGE_MAGIC &&
+			!tliInHistory(header->xlp_tli, private->history))
+			elog(ERROR, "WAL page at %X/%X belongs to timeline %u outside the recovery path",
+				 (uint32) (targetPagePtr >> 32), (uint32) targetPagePtr,
+				 header->xlp_tli);
+	}
 
 	return count;
 }
 
+/*
+ * A zero end-of-WAL marker is expected in the last written page.  Check that
+ * it is followed only by empty or recycled pages, not more current WAL.
+ * A nonzero partial record is not a safe endpoint after a crash.
+ */
+static bool
+unwritten_tail_after(XLogReaderState *state, XLogRecPtr last_lsn)
+{
+	XLogDumpPrivate *private = state->private_data;
+	XLogSegNo	segno;
+	uint32		segoff;
+	uint32		pageoff;
+	uint32		page_start;
+	PGAlignedXLogBlock buf;
+	ssize_t		nread;
+	uint32		off;
+
+	XLByteToSeg(last_lsn, segno, WalSegSz);
+	/* XLogReaderInvalReadState() clears ws_segno on an invalid record. */
+	if (state->seg.ws_file < 0 || private->current_file_segno != segno)
+		return false;
+
+	segoff = XLogSegmentOffset(last_lsn, WalSegSz);
+	pageoff = segoff % XLOG_BLCKSZ;
+	page_start = segoff - pageoff;
+	if (pageoff != 0)
+	{
+		nread = pg_pread(state->seg.ws_file, buf.data, XLOG_BLCKSZ,
+						 page_start);
+		if (nread != XLOG_BLCKSZ)
+			elog(ERROR, "could not inspect WAL tail at %X/%X",
+				 (uint32) (last_lsn >> 32), (uint32) last_lsn);
+		for (off = MAXALIGN(pageoff); off < XLOG_BLCKSZ; off++)
+			if (buf.data[off] != 0)
+				return false;
+		page_start += XLOG_BLCKSZ;
+	}
+
+	for (; page_start < WalSegSz;
+		 page_start += XLOG_BLCKSZ)
+	{
+		XLogPageHeader header;
+		static const char zero_header[sizeof(XLogPageHeaderData)] = {0};
+
+		nread = pg_pread(state->seg.ws_file, buf.data,
+						 sizeof(XLogPageHeaderData), page_start);
+		if (nread != sizeof(XLogPageHeaderData))
+			elog(ERROR, "could not inspect WAL tail at offset %u", page_start);
+		header = (XLogPageHeader) buf.data;
+		if (header->xlp_pageaddr == segno * WalSegSz + page_start)
+			return false;
+		if (memcmp(buf.data, zero_header, sizeof(zero_header)) == 0)
+		{
+			nread = pg_pread(state->seg.ws_file, buf.data,
+							 XLOG_BLCKSZ, page_start);
+			if (nread != XLOG_BLCKSZ)
+				elog(ERROR, "could not inspect WAL tail at offset %u", page_start);
+			for (off = sizeof(zero_header); off < XLOG_BLCKSZ; off++)
+				if (buf.data[off] != 0)
+					return false;
+		}
+	}
+
+	return true;
+}
+
+/* A promotion record can start in a page that still has its parent's TLI. */
+static void
+check_record_timeline(XLogReaderState *state, XLogRecord *record,
+					  TimeLineID target_tli)
+{
+	TimeLineID	record_tli;
+	uint8		info;
+
+	if (record->xl_rmid != RM_XLOG_ID)
+		return;
+
+	info = record->xl_info & ~XLR_INFO_MASK;
+	if (info == XLOG_END_OF_RECOVERY)
+	{
+		xl_end_of_recovery end_of_recovery;
+
+		if (XLogRecGetDataLen(state) < sizeof(end_of_recovery))
+			elog(ERROR, "short end-of-recovery WAL record at %X/%X",
+				 (uint32) (state->ReadRecPtr >> 32),
+				 (uint32) state->ReadRecPtr);
+		memcpy(&end_of_recovery, XLogRecGetData(state),
+			   sizeof(end_of_recovery));
+		record_tli = end_of_recovery.ThisTimeLineID;
+	}
+	else if (info == XLOG_CHECKPOINT_SHUTDOWN ||
+			 info == XLOG_CHECKPOINT_ONLINE)
+	{
+		CheckPoint	checkpoint;
+
+		if (XLogRecGetDataLen(state) < sizeof(checkpoint))
+			elog(ERROR, "short checkpoint WAL record at %X/%X",
+				 (uint32) (state->ReadRecPtr >> 32),
+				 (uint32) state->ReadRecPtr);
+		memcpy(&checkpoint, XLogRecGetData(state), sizeof(checkpoint));
+		record_tli = checkpoint.ThisTimeLineID;
+	}
+	else
+		return;
+
+	if (record_tli != target_tli)
+		elog(ERROR, "WAL record at %X/%X belongs to timeline %u outside the recovery path",
+			 (uint32) (state->ReadRecPtr >> 32),
+			 (uint32) state->ReadRecPtr, record_tli);
+}
+
+
+/* Read the selected local path through its last complete WAL record. */
+static XLogRecPtr
+scan_local_wal(XLogDumpPrivate *private, TimeLineID replay_tli,
+			   TimeLineID *last_tli)
+{
+	XLogRecPtr	last_lsn;
+	XLogReaderState *xlogreader_state;
+	XLogRecord *record;
+	char	   *errormsg;
+
+	if (private->endptr <= private->startptr)
+	{
+		if (private->endptr < private->startptr)
+			elog(ERROR, "could not find WAL at the replay position");
+		if (received_on_path_end(private) > private->startptr)
+			elog(ERROR, "local WAL ends at the replay position before the known received position");
+		*last_tli = replay_tli;
+		return private->startptr;
+	}
+
+	xlogreader_state =
+        XLogReaderAllocate(WalSegSz, private->inpath,
+                           XL_ROUTINE(.page_read = WALDumpReadPage,
+                                      .segment_open = WALDumpOpenSegment,
+                                      .segment_close = WALDumpCloseSegment),
+						   private);
+	if (!xlogreader_state)
+		elog(ERROR, "out of memory");
+
+	PG_TRY();
+	{
+		xlogreader_state->system_identifier = GetSystemIdentifier();
+		XLogBeginRead(xlogreader_state, private->startptr);
+		last_lsn = private->startptr;
+		*last_tli = replay_tli;
+		for (;;)
+		{
+			XLogSegNo	last_segno;
+			XLogSegNo	end_segno;
+
+			record = XLogReadRecord(xlogreader_state, &errormsg);
+			if (!record)
+			{
+				XLByteToSeg(last_lsn, last_segno, WalSegSz);
+				end_segno = private->endptr / WalSegSz;
+				/* XLogReader identifies a record whose continuation was lost. */
+				if (private->endptr_reached &&
+					!XLogRecPtrIsInvalid(xlogreader_state->abortedRecPtr))
+					elog(ERROR, "WAL record at %X/%X extends beyond available local WAL",
+						 (uint32) (xlogreader_state->abortedRecPtr >> 32),
+						 (uint32) xlogreader_state->abortedRecPtr);
+				if (errormsg != NULL && !private->endptr_reached &&
+					(last_segno + 1 < end_segno ||
+					 !unwritten_tail_after(xlogreader_state, last_lsn)))
+					elog(ERROR, "could not scan WAL after %X/%X: %s",
+						 (uint32) (last_lsn >> 32), (uint32) last_lsn,
+						 errormsg);
+				if (received_on_path_end(private) > last_lsn)
+					elog(ERROR, "local WAL ends at %X/%X before the known received position %X/%X",
+						 (uint32) (last_lsn >> 32), (uint32) last_lsn,
+						 (uint32) (private->received_upto >> 32),
+						 (uint32) private->received_upto);
+				break;
+			}
+			check_record_timeline(xlogreader_state, record, replay_tli);
+			last_lsn = xlogreader_state->EndRecPtr;
+			*last_tli = tliOfPointInHistory(xlogreader_state->ReadRecPtr,
+											 private->history);
+		}
+	}
+	PG_CATCH();
+	{
+		XLogReaderFree(xlogreader_state);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	XLogReaderFree(xlogreader_state);
+	return last_lsn;
+}
 
 static XLogRecPtr
 lwaldump_scan(TimeLineID *timeline)
 {
 	XLogRecPtr	last_lsn;
-	XLogReaderState *xlogreader_state;
 	XLogDumpPrivate private;
-	XLogRecord *record;
-	XLogRecPtr	first_record;
 	XLogRecPtr	switchpoint;
 	TimeLineID	replay_tli;
 	TimeLineID	target_tli;
 	TimeLineID	last_tli;
+	TimeLineID	final_replay_tli;
+	TimeLineID	final_received_tli;
+	XLogRecPtr	final_replay_lsn;
+	XLogRecPtr	final_received_upto;
 	bool		target_is_latest;
-	char	   *errormsg;
 
 	memset(&private, 0, sizeof(XLogDumpPrivate));
+	private.received_upto = InvalidXLogRecPtr;
 
-	private.startptr = InvalidXLogRecPtr;
-	private.endptr = InvalidXLogRecPtr;
-	private.endptr_reached = false;
-	private.history = NIL;
-	private.current_file_tli = 0;
+	if (GetRecoveryPauseState() != RECOVERY_PAUSED)
+		elog(ERROR, "WAL replay must be paused before a local WAL scan");
+	if (WalRcvRunning())
+		elog(ERROR, "WAL receiver must be stopped before a local WAL scan");
+	if (recoveryTarget != RECOVERY_TARGET_UNSET)
+		elog(ERROR, "a point-in-time recovery target prevents replay of the local WAL endpoint");
+	private.received_upto = GetWalRcvFlushRecPtr(NULL,
+											&private.received_tli);
 
 	identify_target_directory(&private);
 	private.startptr = GetXLogReplayRecPtr(&replay_tli);
@@ -496,64 +690,25 @@ lwaldump_scan(TimeLineID *timeline)
 		elog(ERROR, "target timeline %u forked from replay timeline %u before the replay position",
 			 target_tli, replay_tli);
 
-	private.endptr = find_local_wal_end(&private);
-
-	/* done with argument parsing, do the actual work */
-
-	/* we have everything we need, start reading */
-	xlogreader_state =
-        XLogReaderAllocate(WalSegSz, private.inpath,
-                           XL_ROUTINE(.page_read = WALDumpReadPage,
-                                      .segment_open = WALDumpOpenSegment,
-                                      .segment_close = WALDumpCloseSegment),
-                           &private);
-	if (!xlogreader_state)
-		elog(ERROR, "out of memory");
-
-
-	first_record = private.startptr;
-	XLogBeginRead(xlogreader_state, first_record);
-
-	last_lsn = private.startptr;
-	last_tli = replay_tli;
 	/*
-	 * Display a message that we're skipping data if `from` wasn't a pointer
-	 * to the start of a record and also wasn't a pointer to the beginning of
-	 * a segment (e.g. we were used in file mode).
+	 * The startup process can retain an open ancestor segment that is no
+	 * longer visible in pg_wal.  A SQL backend cannot inspect that read
+	 * state, so local child WAL does not prove which branch replay will take.
 	 */
-	if (first_record != private.startptr &&
-		XLogSegmentOffset(private.startptr, WalSegSz) != 0) {
-		elog(LOG, ngettext("first record is after %X/%X, at %X/%X, skipping over %u byte\n",
-						"first record is after %X/%X, at %X/%X, skipping over %u bytes\n",
-						(first_record - private.startptr)),
-			   (uint32) (private.startptr >> 32), (uint32) private.startptr,
-			   (uint32) (first_record >> 32), (uint32) first_record,
-			   (uint32) (first_record - private.startptr));
-	} else {
-		elog(LOG, "first record is after %X/%X, at %X/%X",
-		(uint32) (private.startptr >> 32), (uint32) private.startptr,
-		(uint32) (first_record >> 32), (uint32) first_record);
-	}
+	if (target_tli != replay_tli)
+		elog(ERROR, "could not determine recovery path: replay has not reached target timeline %u",
+			 target_tli);
 
-	for (;;)
-	{
-		/* try to read the next record */
-		record = XLogReadRecord(xlogreader_state, &errormsg);
-		if (!record)
-		{
-			break;
-		}
-		/* after reading the first record, continue at next one */
-		first_record = InvalidXLogRecPtr;
-		last_lsn = xlogreader_state->EndRecPtr;
-		last_tli = tliOfPointInHistory(xlogreader_state->ReadRecPtr,
-										 private.history);
-
-		elog(LOG, "next record is at %X/%X\n", (uint32) (last_lsn >> 32), (uint32) last_lsn);
-	}
-
-
-	XLogReaderFree(xlogreader_state);
+	private.endptr = find_local_wal_end(&private);
+	last_lsn = scan_local_wal(&private, replay_tli, &last_tli);
+	final_replay_lsn = GetXLogReplayRecPtr(&final_replay_tli);
+	final_received_upto = GetWalRcvFlushRecPtr(NULL, &final_received_tli);
+	if (GetRecoveryPauseState() != RECOVERY_PAUSED || WalRcvRunning() ||
+		final_replay_lsn != private.startptr ||
+		final_replay_tli != replay_tli ||
+		final_received_upto != private.received_upto ||
+		final_received_tli != private.received_tli)
+		elog(ERROR, "WAL recovery state changed during local WAL scan");
 
 	if (target_is_latest &&
 		find_latest_recovery_target(replay_tli, private.startptr) != target_tli)

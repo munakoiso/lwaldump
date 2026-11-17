@@ -42,7 +42,7 @@ sub read_history
 
 sub expect_path_error
 {
-	my ($node, $label) = @_;
+	my ($node, $label, $detail) = @_;
 	my ($stdout, $stderr);
 	my $exit = $node->psql(
 		'postgres', 'SELECT timeline, flush_lsn FROM lwaldump_with_timeline()',
@@ -50,6 +50,8 @@ sub expect_path_error
 	ok($exit != 0, "$label is rejected");
 	like($stderr, qr/could not determine recovery path/,
 		"$label reports an ambiguous recovery path");
+	like($stderr, $detail, "$label identifies the conflicting WAL")
+	  if defined $detail;
 }
 
 my $primary = new_node('timeline_primary');
@@ -75,6 +77,7 @@ $candidate->start;
 
 my $voter = new_node('timeline_voter');
 $voter->init_from_backup($primary, 'before_fork', has_streaming => 1);
+$voter->append_conf('postgresql.auto.conf', "primary_conninfo = ''");
 
 psql($primary,
 	'INSERT INTO wal_payload SELECT g, repeat(md5(g::text), 12) FROM generate_series(1, 50000) AS g');
@@ -123,21 +126,32 @@ require_wait($replay_voter,
 	'replay voter received WAL through timeline 2');
 my $timeline2_end = psql($candidate, 'SELECT pg_current_wal_flush_lsn()');
 
-$voter->enable_streaming($candidate);
-$voter->append_conf('postgresql.conf', qq(
+my $pitr_voter = new_node('timeline_pitr_voter');
+$pitr_voter->init_from_backup($primary, 'before_fork', has_streaming => 1);
+$pitr_voter->enable_streaming($candidate);
+$pitr_voter->append_conf('postgresql.conf', qq(
 hot_standby = on
 restore_command = ''
 recovery_target_timeline = 'latest'
 recovery_target_lsn = '$fork_lsn'
 recovery_target_action = 'pause'
 ));
+$pitr_voter->start;
+require_wait($pitr_voter,
+	"SELECT pg_get_wal_replay_pause_state() = 'paused'",
+	'PITR voter paused at its recovery target');
+
+$voter->append_conf('postgresql.conf', qq(
+hot_standby = on
+restore_command = ''
+recovery_target_timeline = 'latest'
+recovery_min_apply_delay = '15s'
+));
 $voter->start;
+psql($voter, 'SELECT pg_wal_replay_pause()');
 require_wait($voter,
 	"SELECT pg_get_wal_replay_pause_state() = 'paused'",
-	'voter paused at its PITR target');
-require_wait($voter,
-	"SELECT COALESCE(pg_last_wal_receive_lsn() >= '$timeline2_end'::pg_lsn, false)",
-	'voter received timeline 2 WAL');
+	'voter paused before the timeline fork');
 
 $branch3->append_conf('postgresql.conf', qq(
 hot_standby = on
@@ -148,6 +162,19 @@ $branch3->start;
 require_wait($branch3,
 	"SELECT COALESCE(pg_last_wal_replay_lsn() >= '$replay_source_end'::pg_lsn, false)",
 	'future timeline 3 replayed through its fork');
+# Freeze the parent before promoting a child. Immediate shutdown adds no
+# shutdown checkpoint WAL beyond the future forkpoint.
+psql($candidate, 'SELECT pg_switch_wal()');
+$timeline2_end = psql($candidate, 'SELECT pg_current_wal_flush_lsn()');
+require_wait($branch3,
+	"SELECT COALESCE(pg_last_wal_receive_lsn() >= '$timeline2_end'::pg_lsn, false)",
+	'future timeline 3 received the frozen parent WAL');
+require_wait($replay_voter,
+	"SELECT COALESCE(pg_last_wal_receive_lsn() >= '$timeline2_end'::pg_lsn, false)",
+	'replay voter received the frozen parent WAL');
+$candidate->stop('immediate');
+copy_matching_wal($candidate, $voter, '00000001');
+copy_matching_wal($candidate, $voter, '00000002');
 $branch3->promote;
 psql($branch3,
 	"INSERT INTO wal_payload VALUES (51001, repeat(md5('branch3'), 12))");
@@ -176,15 +203,27 @@ $branch4->stop('fast');
 # before the extension scans, and no archive restore is configured.
 $voter->append_conf('postgresql.auto.conf', "primary_conninfo = ''");
 $replay_voter->append_conf('postgresql.auto.conf', "primary_conninfo = ''");
+$pitr_voter->append_conf('postgresql.auto.conf', "primary_conninfo = ''");
 $voter->reload;
 $replay_voter->reload;
-$candidate->stop('fast');
+$pitr_voter->reload;
 require_wait($voter,
 	'SELECT count(*) = 0 FROM pg_stat_wal_receiver',
 	'voter walreceiver is fenced', 20);
 require_wait($replay_voter,
 	'SELECT count(*) = 0 FROM pg_stat_wal_receiver',
 	'replay voter walreceiver is fenced', 20);
+require_wait($pitr_voter,
+	'SELECT count(*) = 0 FROM pg_stat_wal_receiver',
+	'PITR voter walreceiver is fenced', 20);
+
+my ($target_stdout, $target_stderr);
+my $target_exit = $pitr_voter->psql('postgres',
+	'SELECT timeline, flush_lsn FROM lwaldump_with_timeline()',
+	stdout => \$target_stdout, stderr => \$target_stderr);
+ok($target_exit != 0, 'active PITR target is rejected');
+like($target_stderr, qr/point-in-time recovery target/,
+	'PITR failure explains the replay limit');
 
 my @history3 = read_history($branch3, 3);
 my @history4 = read_history($branch4, 4);
@@ -193,42 +232,39 @@ is((split /\s+/, $history4[-1])[0], '2', 'timeline 4 branched from 2');
 copy_matching_wal($branch3, $voter, '00000003');
 copy_matching_wal($branch3, $replay_voter, '00000003');
 
-my ($replay_tli, $replay_end) = split /\|/,
-	psql($replay_voter,
-		'SELECT timeline, flush_lsn FROM lwaldump_with_timeline()');
-is($replay_tli, '3', 'paused standby reports the end on timeline 3');
-ok(lsn_ge($replay_voter, $replay_end, $timeline3_end),
-	'local scan covers timeline 3 WAL');
-is(psql($replay_voter,
-	"SELECT pg_last_wal_replay_lsn() < '$replay_end'::pg_lsn"),
-	't', 'replay still lags behind scanned endpoint');
+expect_path_error($replay_voter, 'pending timeline 3 switch',
+	qr/replay has not reached target timeline 3/);
 
 psql($replay_voter, 'SELECT pg_wal_replay_resume()');
 require_wait($replay_voter,
-	"SELECT COALESCE(pg_last_wal_replay_lsn() >= '$replay_end'::pg_lsn, false)",
-	'PostgreSQL replayed through the scanned timeline 3 endpoint');
+	'SELECT EXISTS (SELECT 1 FROM wal_payload WHERE id = 51001)',
+	'PostgreSQL replayed the timeline 3 record');
 is(psql($replay_voter, 'SELECT pg_is_in_recovery()'), 't',
 	'replay voter remains in recovery');
-is(psql($replay_voter,
-	'SELECT count(*) = 1 FROM wal_payload WHERE id = 51001'),
-	't', 'timeline 3 row is visible after replay');
+psql($replay_voter, 'SELECT pg_wal_replay_pause()');
+require_wait($replay_voter,
+	"SELECT pg_get_wal_replay_pause_state() = 'paused'",
+	'replay voter paused after switching to timeline 3');
+my ($replay_tli, $replay_end) = split /\|/,
+	psql($replay_voter,
+		'SELECT timeline, flush_lsn FROM lwaldump_with_timeline()');
+is($replay_tli, '3', 'paused standby reports timeline 3 after replay switched');
+ok(lsn_ge($replay_voter, $replay_end, $timeline3_end),
+	'local scan covers timeline 3 WAL after replay switched');
 
 my @history2 = read_history($voter, 2);
 my $switchpoint = (split /\s+/, $history2[0])[1];
 is(psql($voter,
 	"SELECT pg_wal_lsn_diff('$switchpoint', '0/0')::numeric % pg_size_bytes(current_setting('wal_segment_size'))"),
 	'0', 'timeline 2 switchpoint is on a WAL segment boundary');
-my ($voter_tli, $voter_end) = split /\|/,
-	psql($voter, 'SELECT timeline, flush_lsn FROM lwaldump_with_timeline()');
-is($voter_tli, '3', 'PITR voter sees timeline 3 local WAL');
-ok(lsn_ge($voter, $voter_end, $timeline3_end),
-	'PITR voter scan covers timeline 3 WAL');
+expect_path_error($voter, 'pending timeline 3 switch',
+	qr/replay has not reached target timeline 3/);
 
+my $voter_wal = $voter->data_dir . '/pg_wal';
 copy_matching_wal($branch4, $voter, '00000004');
 expect_path_error($voter, 'sibling timelines 3 and 4');
 
 # Rewrite TLI 4 as a descendant of 3 and add an unrelated newer history.
-my $voter_wal = $voter->data_dir . '/pg_wal';
 copy($history3, "$voter_wal/00000004.history")
   or BAIL_OUT("could not rewrite timeline 4 history: $!");
 open(my $hist4, '>>', "$voter_wal/00000004.history")
@@ -240,29 +276,19 @@ open(my $hist5, '>', "$voter_wal/00000005.history")
 print {$hist5} "1\t$switchpoint\tunrelated newest timeline\n";
 close($hist5);
 expect_path_error($voter, 'incompatible newest timeline 5');
+unlink("$voter_wal/00000004.history", "$voter_wal/00000005.history") == 2
+  or BAIL_OUT("could not remove synthetic histories: $!");
 
 # PostgreSQL parsed this postmaster GUC using base 0. The extension should
 # consume its numeric value rather than parse the text a second time.
 $voter->stop('immediate');
 $voter->append_conf('postgresql.auto.conf', "recovery_target_timeline = '0x2'");
 $voter->start;
-my ($numeric_tli, $numeric_end) = split /\|/,
-	psql($voter, 'SELECT timeline, flush_lsn FROM lwaldump_with_timeline()');
-is($numeric_tli, '2', 'numeric recovery target 0x2 resolves to timeline 2');
-ok(lsn_ge($voter, $numeric_end, $timeline2_end),
-	'numeric target scan covers timeline 2 WAL');
-
-# Remove the child copy of the switchpoint segment and check that the scan
-# stops at the switch, without reading divergent parent WAL beyond it.
-$voter->stop('immediate');
-opendir(my $wal_dir, $voter_wal) or BAIL_OUT("could not open $voter_wal: $!");
-my @child_segments = sort grep { /^00000002[0-9A-F]{16}$/ } readdir($wal_dir);
-closedir($wal_dir);
-BAIL_OUT('could not find a timeline 2 WAL segment') unless @child_segments;
-rename("$voter_wal/$child_segments[0]", "$voter_wal/$child_segments[0].saved")
-  or BAIL_OUT("could not hide child switchpoint segment: $!");
-$voter->start;
-is(psql($voter, 'SELECT timeline, flush_lsn FROM lwaldump_with_timeline()'),
-	"1|$switchpoint", 'missing child segment stops at switchpoint');
+psql($voter, 'SELECT pg_wal_replay_pause()');
+require_wait($voter,
+	"SELECT pg_get_wal_replay_pause_state() = 'paused'",
+	'numeric voter is paused after restart');
+expect_path_error($voter, 'numeric recovery target 0x2',
+	qr/replay has not reached target timeline 2/);
 
 done_testing();
