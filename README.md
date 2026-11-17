@@ -65,3 +65,16 @@ SELECT * FROM lwaldump_with_timeline();
 
 The function is valid only on a server in recovery with a replay position and
 readable local WAL files.
+
+## Tests
+
+The integration tests use PostgreSQL's TAP framework and create their own
+primary and standby nodes. Run `make installcheck` after installing the
+extension, using a PostgreSQL build with TAP support and the required Perl
+modules. The CI Docker image provides those dependencies:
+
+```sh
+docker build --build-arg PG_MAJOR=17 --build-arg PG_TAG=17-bookworm \
+  -f tests/Dockerfile -t lwaldump-test:17 .
+docker run --rm lwaldump-test:17
+```

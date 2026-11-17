@@ -7,6 +7,7 @@ OBJS = \
 
 EXTENSION = lwaldump
 DATA = lwaldump--1.0.sql
+TAP_TESTS = 1
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

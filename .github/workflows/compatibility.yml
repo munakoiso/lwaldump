@@ -33,5 +33,5 @@ jobs:
           -f tests/Dockerfile
           -t lwaldump-test:${{ matrix.pg_major }}
           .
-      - name: Test fenced standby WAL endpoint
-        run: docker run --rm -e PG_MAJOR=${{ matrix.pg_major }} lwaldump-test:${{ matrix.pg_major }}
+      - name: Run TAP tests
+        run: docker run --rm lwaldump-test:${{ matrix.pg_major }}
