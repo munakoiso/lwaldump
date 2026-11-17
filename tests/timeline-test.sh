@@ -100,7 +100,7 @@ chmod 700 "$BRANCH3" "$BRANCH4"
 # Unlike the voter below, this standby uses a regular replay pause rather than
 # recovery_target_action. This lets us verify that PostgreSQL can actually
 # replay through the position returned by lwaldump without ending recovery.
-run_as_postgres "$BIN/pg_basebackup -h '$CANDIDATE_SOCKET' -p 55443 -D '$REPLAY_VOTER' -X stream -R --checkpoint=fast" >/dev/null
+cp -a "$BRANCH3/." "$REPLAY_VOTER/"
 chmod 700 "$REPLAY_VOTER"
 cat >>"$REPLAY_VOTER/postgresql.conf" <<EOF
 port = 55447
@@ -116,8 +116,8 @@ run_as_postgres "$BIN/psql -h '$REPLAY_VOTER_SOCKET' -p 55447 -d postgres -v ON_
 
 i=0
 while :; do
-    replay_paused_manually="$(run_as_postgres "$BIN/psql -h '$REPLAY_VOTER_SOCKET' -p 55447 -d postgres -Atc 'SELECT pg_is_wal_replay_paused()'")"
-    [ "$replay_paused_manually" = "t" ] && break
+    replay_pause_state="$(run_as_postgres "$BIN/psql -h '$REPLAY_VOTER_SOCKET' -p 55447 -d postgres -Atc 'SELECT pg_get_wal_replay_pause_state()'")"
+    [ "$replay_pause_state" = "paused" ] && break
     i=$((i + 1))
     [ "$i" -lt 240 ] || { echo "replay voter did not pause recovery"; exit 37; }
     sleep 0.25
@@ -156,8 +156,8 @@ run_as_postgres "$BIN/pg_ctl -D '$VOTER' -l '$ROOT/voter.log' -w start" >/dev/nu
 
 i=0
 while :; do
-    replay_paused="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -Atc 'SELECT pg_is_wal_replay_paused()'")"
-    [ "$replay_paused" = "t" ] && break
+    replay_pause_state="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -Atc 'SELECT pg_get_wal_replay_pause_state()'")"
+    [ "$replay_pause_state" = "paused" ] && break
     i=$((i + 1))
     [ "$i" -lt 240 ] || { echo "voter did not pause recovery at $fork_lsn"; exit 29; }
     sleep 0.25
@@ -180,11 +180,18 @@ hot_standby = on
 restore_command = ''
 recovery_target_timeline = 'current'
 EOF
-cat >>"$BRANCH3/postgresql.auto.conf" <<EOF
-primary_conninfo = ''
-EOF
-chown postgres:postgres "$BRANCH3/postgresql.conf" "$BRANCH3/postgresql.auto.conf"
+chown postgres:postgres "$BRANCH3/postgresql.conf"
 run_as_postgres "$BIN/pg_ctl -D '$BRANCH3' -l '$ROOT/branch3.log' -w start" >/dev/null
+
+i=0
+while :; do
+    branch3_replayed="$(run_as_postgres "$BIN/psql -h '$BRANCH3_SOCKET' -p 55445 -d postgres -Atc \"SELECT COALESCE(pg_last_wal_replay_lsn() >= '$replay_source_end'::pg_lsn, false)\"")"
+    [ "$branch3_replayed" = "t" ] && break
+    i=$((i + 1))
+    [ "$i" -lt 240 ] || { echo "future timeline 3 did not replay through $replay_source_end"; exit 46; }
+    sleep 0.25
+done
+
 run_as_postgres "$BIN/pg_ctl -D '$BRANCH3' -w promote" >/dev/null
 run_as_postgres "$BIN/psql -h '$BRANCH3_SOCKET' -p 55445 -d postgres -v ON_ERROR_STOP=1 -c \"INSERT INTO wal_payload VALUES (51001, repeat(md5('branch3'), 12))\"" >/dev/null
 timeline3_end="$(run_as_postgres "$BIN/psql -h '$BRANCH3_SOCKET' -p 55445 -d postgres -Atc 'SELECT pg_current_wal_flush_lsn()'")"
@@ -244,15 +251,24 @@ while :; do
     sleep 0.25
 done
 
+[ "$(awk 'END { print $1 }' "$BRANCH3/pg_wal/00000003.history")" = "2" ] || exit 31
+[ "$(awk 'END { print $1 }' "$BRANCH4/pg_wal/00000004.history")" = "2" ] || exit 32
+cp "$BRANCH3"/pg_wal/00000003* "$VOTER/pg_wal/"
+cp "$BRANCH3"/pg_wal/00000003* "$REPLAY_VOTER/pg_wal/"
+chown postgres:postgres "$VOTER"/pg_wal/00000003* "$REPLAY_VOTER"/pg_wal/00000003*
+
 replay_result="$(run_as_postgres "$BIN/psql -h '$REPLAY_VOTER_SOCKET' -p 55447 -d postgres -AtF '|' -v ON_ERROR_STOP=1 -c 'SELECT timeline, flush_lsn FROM lwaldump_with_timeline()'")"
 replay_timeline="${replay_result%%|*}"
 replay_flush_lsn="${replay_result#*|}"
-replay_covers_source="$(run_as_postgres "$BIN/psql -h '$REPLAY_VOTER_SOCKET' -p 55447 -d postgres -Atc \"SELECT '$replay_flush_lsn'::pg_lsn >= '$replay_source_end'::pg_lsn\"")"
+replay_covers_timeline3="$(run_as_postgres "$BIN/psql -h '$REPLAY_VOTER_SOCKET' -p 55447 -d postgres -Atc \"SELECT '$replay_flush_lsn'::pg_lsn >= '$timeline3_end'::pg_lsn\"")"
+replay_lsn_before_resume="$(run_as_postgres "$BIN/psql -h '$REPLAY_VOTER_SOCKET' -p 55447 -d postgres -Atc 'SELECT pg_last_wal_replay_lsn()'")"
+replay_is_behind="$(run_as_postgres "$BIN/psql -h '$REPLAY_VOTER_SOCKET' -p 55447 -d postgres -Atc \"SELECT '$replay_lsn_before_resume'::pg_lsn < '$replay_flush_lsn'::pg_lsn\"")"
 
 echo "REPLAYABLE_OUTPUT=$replay_result"
-echo "REPLAY_SOURCE_END=$replay_source_end"
-[ "$replay_timeline" = "2" ] || exit 40
-[ "$replay_covers_source" = "t" ] || exit 41
+echo "REPLAY_LSN_BEFORE_RESUME=$replay_lsn_before_resume"
+[ "$replay_timeline" = "3" ] || exit 40
+[ "$replay_covers_timeline3" = "t" ] || exit 41
+[ "$replay_is_behind" = "t" ] || exit 44
 
 run_as_postgres "$BIN/psql -h '$REPLAY_VOTER_SOCKET' -p 55447 -d postgres -v ON_ERROR_STOP=1 -c 'SELECT pg_wal_replay_resume()'" >/dev/null
 i=0
@@ -265,14 +281,12 @@ while :; do
 done
 
 still_in_recovery="$(run_as_postgres "$BIN/psql -h '$REPLAY_VOTER_SOCKET' -p 55447 -d postgres -Atc 'SELECT pg_is_in_recovery()'")"
+replayed_timeline3_row="$(run_as_postgres "$BIN/psql -h '$REPLAY_VOTER_SOCKET' -p 55447 -d postgres -Atc 'SELECT count(*) = 1 FROM wal_payload WHERE id = 51001'")"
 echo "REPLAY_REACHED=$replay_reached"
 echo "STILL_IN_RECOVERY=$still_in_recovery"
+echo "REPLAYED_TIMELINE3_ROW=$replayed_timeline3_row"
 [ "$still_in_recovery" = "t" ] || exit 43
-
-[ "$(awk 'END { print $1 }' "$BRANCH3/pg_wal/00000003.history")" = "2" ] || exit 31
-[ "$(awk 'END { print $1 }' "$BRANCH4/pg_wal/00000004.history")" = "2" ] || exit 32
-cp "$BRANCH3"/pg_wal/00000003* "$VOTER/pg_wal/"
-chown postgres:postgres "$VOTER"/pg_wal/00000003*
+[ "$replayed_timeline3_row" = "t" ] || exit 45
 
 switchpoint="$(awk 'NR == 1 { print $2 }' "$VOTER/pg_wal/00000002.history")"
 switch_offset="$(run_as_postgres "$BIN/psql -h '$VOTER_SOCKET' -p 55444 -d postgres -Atc \"SELECT pg_wal_lsn_diff('$switchpoint', '0/0')::numeric % pg_size_bytes(current_setting('wal_segment_size'))\"")"
